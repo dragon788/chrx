@@ -755,9 +755,15 @@ validate_config()
   ##
   ## Detection priority:
   ## 1. Already booted in UEFI mode (/sys/firmware/efi exists)
-  ## 2. MrChromebox UEFI Full ROM firmware detected
-  ## 3. Newer CPU families that typically have AltFw/Tianocore support
-  ## 4. Default to grub-pc (Legacy/SeaBIOS)
+  ## 2. AltFw enabled (dev_boot_altfw=1) on newer CPU families
+  ##    - 2019+ devices with altfw support have Tianocore/edk2 (UEFI)
+  ##    - Older devices typically have SeaBIOS (legacy BIOS)
+  ## 3. Default to grub-pc (Legacy/SeaBIOS)
+  ##
+  ## Note: To manually inspect RW_LEGACY contents, use cbfstool:
+  ##   flashrom -r /tmp/bios.bin
+  ##   cbfstool /tmp/bios.bin print -r RW_LEGACY
+  ## Look for: altfw/list (2019+ multi-boot), payload, or tianocore
   ##
   ## User can always override with -b flag
 
@@ -771,8 +777,11 @@ validate_config()
   fi
 
   ## Check for AltFw (Alternative Firmware) enabled on newer devices
+  ## dev_boot_altfw: 2019+ devices with altfw/list support (multiple bootloaders)
+  ## dev_boot_legacy: Older devices with single legacy bootloader
   ## Newer devices (Gemini Lake+) with AltFw typically use Tianocore/edk2 (UEFI)
   ## Older devices with legacy boot use SeaBIOS (not UEFI)
+  ## Hint: Two beeps at Ctrl+L = RW_LEGACY empty or dev_boot_legacy not enabled
   if [ -z "$_detected_efi" ]; then
     local _altfw_enabled=""
     ## Check crossystem for AltFw/Legacy boot enabled
