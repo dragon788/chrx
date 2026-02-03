@@ -221,12 +221,14 @@ identify_hardware()
     TGL) _cpuf="Intel Tiger Lake" ;;   # succeeds ICL
     ADL) _cpuf="Intel Alder Lake" ;;   # succeeds TGL
     RPL) _cpuf="Intel Raptor Lake" ;;  # succeeds ADL
+    MTL) _cpuf="Intel Meteor Lake" ;;  # succeeds RPL
     #
     BYT) _cpuf="Intel Bay Trail" ;;
     BSW) _cpuf="Intel Braswell" ;;     # succeeds BYT
     APL) _cpuf="Intel Apollo Lake" ;;  # succeeds BSW
     GLK) _cpuf="Intel Gemini Lake" ;;  # succeeds APL
     JSL) _cpuf="Intel Jasper Lake" ;;  # succeeds GLK
+    TWL) _cpuf="Intel Twin Lake" ;;    # succeeds JSL (N150/N250/N350/N355)
     *)   _cpuf="(unrecognized)" ;;
   esac
 
@@ -868,7 +870,7 @@ validate_config()
   if [ -z "$_detected_efi" ]; then
     ## Determine payload type based on CPU family (platform constraint, not user choice)
     case "${CHRX_HWCPUF}" in
-      "Intel Gemini Lake"|"Intel Whiskey Lake"|"Intel Comet Lake"|"Intel Amber Lake"|"Intel Tiger Lake"|"Intel Jasper Lake"|"Intel Alder Lake"|"Intel Raptor Lake")
+      "Intel Gemini Lake"|"Intel Whiskey Lake"|"Intel Comet Lake"|"Intel Amber Lake"|"Intel Tiger Lake"|"Intel Jasper Lake"|"Intel Alder Lake"|"Intel Raptor Lake"|"Intel Meteor Lake"|"Intel Twin Lake")
         ## 2019+ platforms use Tianocore/edk2 (UEFI) - this is the only option
         _detected_efi=1
         _detect_reason="${CHRX_HWCPUF} platform uses Tianocore/UEFI"
