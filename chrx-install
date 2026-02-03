@@ -217,12 +217,16 @@ identify_hardware()
     KBL) _cpuf="Intel Kaby Lake" ;;    # succeeds SKL
     AML) _cpuf="Intel Amber Lake" ;;   # succeeds KBL
     WHL) _cpuf="Intel Whiskey Lake" ;; # succeeds KBL
-    CML) _cpuf="Intel Coffee Lake" ;;  # succeeds KBL
+    CML) _cpuf="Intel Comet Lake" ;;   # succeeds KBL
+    TGL) _cpuf="Intel Tiger Lake" ;;   # succeeds ICL
+    ADL) _cpuf="Intel Alder Lake" ;;   # succeeds TGL
+    RPL) _cpuf="Intel Raptor Lake" ;;  # succeeds ADL
     #
     BYT) _cpuf="Intel Bay Trail" ;;
     BSW) _cpuf="Intel Braswell" ;;     # succeeds BYT
     APL) _cpuf="Intel Apollo Lake" ;;  # succeeds BSW
     GLK) _cpuf="Intel Gemini Lake" ;;  # succeeds APL
+    JSL) _cpuf="Intel Jasper Lake" ;;  # succeeds GLK
     *)   _cpuf="(unrecognized)" ;;
   esac
 
@@ -753,19 +757,20 @@ validate_config()
 
   ## Auto-detect EFI bootloader based on firmware and CPU
   ##
+  ## The platform determines the payload type (not user choice):
+  ##   - 2019+ devices (Gemini Lake+): Tianocore/edk2 ONLY -> grub-efi-amd64
+  ##   - Pre-2019 devices: SeaBIOS ONLY -> grub-pc
+  ##
   ## Detection priority:
   ## 1. Already booted in UEFI mode (/sys/firmware/efi exists)
-  ## 2. AltFw enabled (dev_boot_altfw=1) on newer CPU families
-  ##    - 2019+ devices with altfw support have Tianocore/edk2 (UEFI)
-  ##    - Older devices typically have SeaBIOS (legacy BIOS)
+  ## 2. CPU family determines payload type (platform constraint)
   ## 3. Default to grub-pc (Legacy/SeaBIOS)
   ##
   ## Note: To manually inspect RW_LEGACY contents, use cbfstool:
-  ##   flashrom -r /tmp/bios.bin
   ##   cbfstool /tmp/bios.bin print -r RW_LEGACY
   ## Look for: altfw/list (2019+ multi-boot), payload, or tianocore
   ##
-  ## User can always override with -b flag
+  ## User can override with -b flag if needed
 
   local _detected_efi=""
   local _detect_reason=""
@@ -776,45 +781,24 @@ validate_config()
     _detect_reason="UEFI boot environment detected"
   fi
 
-  ## Check for AltFw (Alternative Firmware) enabled on newer devices
-  ## dev_boot_altfw: 2019+ devices with altfw/list support (multiple bootloaders)
-  ## dev_boot_legacy: Older devices with single legacy bootloader
-  ## Newer devices (Gemini Lake+) with AltFw typically use Tianocore/edk2 (UEFI)
-  ## Older devices with legacy boot use SeaBIOS (not UEFI)
+  ## Determine bootloader type based on CPU family
+  ## The platform determines the payload type - users don't choose:
+  ##   - 2019+ devices (Gemini Lake+): Tianocore/edk2 ONLY (UEFI boot)
+  ##   - Pre-2019 devices: SeaBIOS ONLY (legacy BIOS boot)
   ## Hint: Two beeps at Ctrl+L = RW_LEGACY empty or dev_boot_legacy not enabled
   if [ -z "$_detected_efi" ]; then
-    local _altfw_enabled=""
-    ## Check crossystem for AltFw/Legacy boot enabled
-    ## dev_boot_altfw is the newer flag, dev_boot_legacy is deprecated but still used
-    if crossystem dev_boot_altfw 2>/dev/null | grep -q "1"; then
-      _altfw_enabled=1
-    elif crossystem dev_boot_legacy 2>/dev/null | grep -q "1"; then
-      _altfw_enabled=1
-    fi
-
-    if [ -n "$_altfw_enabled" ]; then
-      ## AltFw is enabled - check if it's likely Tianocore (UEFI) based on CPU
-      case "${CHRX_HWCPUF}" in
-        "Intel Gemini Lake"|"Intel Whiskey Lake"|"Intel Coffee Lake"|"Intel Amber Lake"|"Intel Comet Lake")
-          ## Newer CPUs with AltFw enabled likely have Tianocore/edk2
-          _detected_efi=1
-          _detect_reason="AltFw enabled on ${CHRX_HWCPUF} (likely Tianocore/UEFI)"
-          ;;
-        *)
-          ## Older CPUs with AltFw likely have SeaBIOS (legacy)
-          echo_info "Note: AltFw/Legacy boot is enabled (likely SeaBIOS)."
-          echo_info "If you have Tianocore/UEFI firmware, use: chrx -b efi"
-          ;;
-      esac
-    else
-      ## AltFw not enabled - inform user if they have a newer CPU
-      case "${CHRX_HWCPUF}" in
-        "Intel Gemini Lake"|"Intel Whiskey Lake"|"Intel Coffee Lake"|"Intel Amber Lake"|"Intel Comet Lake")
-          echo_info "Note: ${CHRX_HWCPUF} devices can support UEFI boot via AltFw/Tianocore."
-          echo_info "Run MrChromebox firmware utility to enable, then use: chrx -b efi"
-          ;;
-      esac
-    fi
+    ## Determine payload type based on CPU family (platform constraint, not user choice)
+    case "${CHRX_HWCPUF}" in
+      "Intel Gemini Lake"|"Intel Whiskey Lake"|"Intel Comet Lake"|"Intel Amber Lake"|"Intel Tiger Lake"|"Intel Jasper Lake"|"Intel Alder Lake"|"Intel Raptor Lake")
+        ## 2019+ platforms use Tianocore/edk2 (UEFI) - this is the only option
+        _detected_efi=1
+        _detect_reason="${CHRX_HWCPUF} platform uses Tianocore/UEFI"
+        ;;
+      *)
+        ## Pre-2019 platforms use SeaBIOS (legacy BIOS) - this is the only option
+        echo_info "Note: ${CHRX_HWCPUF} platform uses SeaBIOS (legacy BIOS boot)."
+        ;;
+    esac
   fi
 
   if [ -n "$_detected_efi" ]; then
