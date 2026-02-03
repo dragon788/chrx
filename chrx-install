@@ -764,29 +764,21 @@ validate_config()
   local _detected_efi=""
   local _detect_reason=""
 
-  ## Check if already running in UEFI mode (e.g., booted from UEFI Live USB)
+  ## Check if already running in UEFI mode (e.g., booted from UEFI Live USB or Full ROM)
   if [ -d /sys/firmware/efi ]; then
     _detected_efi=1
-    _detect_reason="UEFI boot detected"
-  fi
-
-  ## Check for MrChromebox UEFI Full ROM firmware
-  if [ -z "$_detected_efi" ]; then
-    local _bios_vendor=$(dmidecode -s bios-vendor 2>/dev/null)
-    local _bios_version=$(dmidecode -s bios-version 2>/dev/null)
-    if echo "$_bios_vendor $_bios_version" | grep -qi "mrchromebox\|coreboot.*edk2\|tianocore"; then
-      _detected_efi=1
-      _detect_reason="MrChromebox/UEFI firmware detected"
-    fi
+    _detect_reason="UEFI boot environment detected"
   fi
 
   ## Check for newer CPU families that typically have AltFw/Tianocore support
-  ## These devices often have RW_LEGACY with edk2 payload
+  ## These devices often have RW_LEGACY with edk2 payload available
+  ## Note: This doesn't guarantee UEFI is available, just that it's likely
   if [ -z "$_detected_efi" ]; then
     case "${CHRX_HWCPUF}" in
       "Intel Gemini Lake"|"Intel Whiskey Lake"|"Intel Coffee Lake"|"Intel Amber Lake"|"Intel Comet Lake")
-        _detected_efi=1
-        _detect_reason="CPU family (${CHRX_HWCPUF}) typically has UEFI support"
+        ## Don't auto-select EFI for these - just inform user
+        echo_info "Note: ${CHRX_HWCPUF} devices often support UEFI boot via AltFw/Tianocore."
+        echo_info "If you have UEFI firmware, use: chrx -b efi"
         ;;
     esac
   fi
@@ -794,7 +786,7 @@ validate_config()
   if [ -n "$_detected_efi" ]; then
     CHRX_BOOTLOADER="grub-efi-amd64"
     echo_info "Auto-detected UEFI: ${_detect_reason}"
-    echo_info "Using EFI bootloader. Override with -b grub-pc if needed."
+    echo_info "Using EFI bootloader. Override with -b legacy if needed."
   fi
 
   ## User argument always overrides auto-detection
