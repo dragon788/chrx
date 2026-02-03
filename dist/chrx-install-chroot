@@ -47,9 +47,8 @@ install_curl()
 install_utilities()
 {
   apt_get_update_if_needed
-  ## Note: grub-pc or grub-efi will be installed later by install_grub()
-  ## based on whether system is BIOS or UEFI
-  apt_get_install zram-config
+  ## Install zram and the selected bootloader package
+  apt_get_install zram-config ${CHRX_BOOTLOADER}
 }
 
 apt_get_install()
@@ -581,14 +580,9 @@ galliumos_update_core_image()
   APT_DB_NEEDS_UPDATE=1
 }
 
-is_efi_enabled() {
-  ## Check if EFI mode is enabled
-  ## Priority: 1) explicit -E flag (CHRX_USE_EFI), 2) detected UEFI boot environment
-  if [ "${CHRX_USE_EFI}" ]; then
-    return 0
-  fi
-  ## Fallback: check if currently booted in UEFI mode
-  [ -d /sys/firmware/efi ]
+is_efi_bootloader() {
+  ## Check if EFI bootloader is selected
+  [[ "${CHRX_BOOTLOADER}" == *efi* ]]
 }
 
 write_default_fstab()
@@ -602,7 +596,7 @@ write_default_fstab()
   echo "${CHRX_ROOT_PARTITION} / ext4 defaults,discard,relatime 1 1" >> /etc/fstab
 
   ## Add EFI partition to fstab if UEFI system and partition is set
-  if is_efi_enabled && [ -n "${CHRX_EFI_PARTITION}" ]; then
+  if is_efi_bootloader && [ -n "${CHRX_EFI_PARTITION}" ]; then
     echo_title "Adding EFI partition to fstab..."
     echo "${CHRX_EFI_PARTITION} /boot/efi vfat umask=0077 0 1" >> /etc/fstab
     ## Ensure mount point exists
@@ -632,33 +626,22 @@ install_grub()
     echo_title_yel "(skipping chrx grub config)"
   fi
 
-  if is_efi_enabled && [ -n "${CHRX_EFI_PARTITION}" ]; then
-    echo_title "Installing GRUB for UEFI boot..."
-    ## Install GRUB EFI packages
-    apt_get_install grub-efi-amd64 grub-efi-amd64-signed shim-signed
+  echo_title "Installing GRUB (${CHRX_BOOTLOADER})..."
 
+  ## Build grub-install command based on bootloader type
+  local EFI_DIR_CMD=""
+  if is_efi_bootloader && [ -n "${CHRX_EFI_PARTITION}" ]; then
+    echo_title "Setting up EFI boot..."
     ## Ensure EFI partition is mounted
     if ! mountpoint -q /boot/efi; then
       mkdir -p /boot/efi
       mount ${CHRX_EFI_PARTITION} /boot/efi
     fi
-
-    ## Generate GRUB config
-    grub-mkconfig -o /boot/grub/grub.cfg
-
-    ## Install GRUB to EFI System Partition
-    ## --removable installs to the fallback boot path for better compatibility
-    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck
-    ## Also install to removable path for firmware compatibility
-    grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck 2>/dev/null || true
-  else
-    echo_title "Installing GRUB for Legacy/BIOS boot..."
-    ## Install GRUB PC package for BIOS boot
-    apt_get_install grub-pc
-
-    grub-mkconfig -o /boot/grub/grub.cfg
-    grub-install ${CHRX_TARGET_DISK} --force
+    EFI_DIR_CMD="--removable --target=x86_64-efi --efi-directory=/boot/efi"
   fi
+
+  grub-install ${EFI_DIR_CMD} --boot-directory=/boot ${CHRX_TARGET_DISK} --force
+  grub-mkconfig -o /boot/grub/grub.cfg
 }
 
 fedora_install_grub2()
@@ -675,10 +658,12 @@ GRUB_DISABLE_RECOVERY="true"
 GRUB_DISABLE_LINUX_UUID="true"
 EOF
 
-  if is_efi_enabled && [ -n "${CHRX_EFI_PARTITION}" ]; then
-    echo_title "Installing GRUB2 for UEFI boot..."
+  echo_title "Installing GRUB2 (${CHRX_BOOTLOADER})..."
+
+  local EFI_DIR_CMD=""
+  if is_efi_bootloader && [ -n "${CHRX_EFI_PARTITION}" ]; then
+    echo_title "Setting up EFI boot..."
     ## For Fedora UEFI, install shim and grub2-efi packages
-    ## This is the recommended method per Fedora documentation
     dnf ${VERBOSITY_DNF} -y install grub2-efi-x64 grub2-efi-x64-modules shim-x64
 
     ## Ensure EFI partition is mounted
@@ -689,24 +674,18 @@ EOF
 
     ## Create EFI directory structure
     mkdir -p /boot/efi/EFI/fedora
-
-    ## Generate GRUB2 config
-    grub2-mkconfig -o /boot/grub2/grub.cfg
-
-    ## Install GRUB2 to EFI System Partition
-    ## Note: For Fedora, reinstalling shim/grub2-efi packages handles EFI installation
-    ## but we can also run grub2-install for the EFI target
-    grub2-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=fedora --recheck
-    ## Also install to removable path for firmware compatibility
-    grub2-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck 2>/dev/null || true
-
-    ## Copy GRUB config to EFI partition for some firmware
-    cp /boot/grub2/grub.cfg /boot/efi/EFI/fedora/ 2>/dev/null || true
+    EFI_DIR_CMD="--removable --target=x86_64-efi --efi-directory=/boot/efi"
   else
-    echo_title "Installing GRUB2 for Legacy/BIOS boot..."
+    ## For Fedora Legacy/BIOS boot
     dnf ${VERBOSITY_DNF} -y install grub2 grub2-pc grub2-pc-modules
-    grub2-mkconfig -o /boot/grub2/grub.cfg
-    grub2-install ${CHRX_TARGET_DISK} --force
+  fi
+
+  grub2-install ${EFI_DIR_CMD} ${CHRX_TARGET_DISK} --force
+  grub2-mkconfig -o /boot/grub2/grub.cfg
+
+  ## Copy GRUB config to EFI partition for some firmware
+  if is_efi_bootloader; then
+    cp /boot/grub2/grub.cfg /boot/efi/EFI/fedora/ 2>/dev/null || true
   fi
 }
 
