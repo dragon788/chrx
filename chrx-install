@@ -610,6 +610,84 @@ check_support_for_legacy_boot()
   fi
 }
 
+check_altfw_payload()
+{
+  ## Check if RW_LEGACY has a valid bootloader payload installed
+  ## This is critical after ChromeOS recovery which may wipe the payload
+  ##
+  ## Uses cbfstool to inspect RW_LEGACY region for:
+  ##   - altfw/list (2019+ multi-boot menu)
+  ##   - payload or tianocore (bootloader)
+
+  echo_info "Checking for alternative firmware payload...  \c"
+
+  local _cbfstool=""
+  local _flashrom=""
+  local _payload_found=""
+
+  ## Find cbfstool - may be in /usr/local/bin from MrChromebox or in PATH
+  if [ -x /usr/local/bin/cbfstool ]; then
+    _cbfstool=/usr/local/bin/cbfstool
+  elif command -v cbfstool >/dev/null 2>&1; then
+    _cbfstool=$(command -v cbfstool)
+  fi
+
+  ## Find flashrom
+  if [ -x /usr/sbin/flashrom ]; then
+    _flashrom=/usr/sbin/flashrom
+  elif command -v flashrom >/dev/null 2>&1; then
+    _flashrom=$(command -v flashrom)
+  fi
+
+  ## If we have both tools, check for payload
+  if [ -n "$_cbfstool" ] && [ -n "$_flashrom" ]; then
+    ## Read firmware to temp file
+    local _tmpbios="/tmp/bios_check.bin"
+    if $_flashrom -r "$_tmpbios" >/dev/null 2>&1; then
+      ## Check RW_LEGACY region for payload
+      if $_cbfstool "$_tmpbios" print -r RW_LEGACY 2>/dev/null | grep -qE "payload|altfw|tianocore|seabios"; then
+        _payload_found=1
+        echo_info "OK (payload found)"
+      fi
+      rm -f "$_tmpbios"
+    fi
+  fi
+
+  if [ -z "$_payload_found" ]; then
+    echo_warn "WARNING"
+    cat <<- EOMSG
+	${ANSI_YEL}
+	  ╔══════════════════════════════════════════════════════════════════╗
+	  ║              Alternative Firmware Payload Not Found              ║
+	  ╠══════════════════════════════════════════════════════════════════╣
+	  ║  Could not verify that RW_LEGACY contains a bootloader payload.  ║
+	  ║                                                                  ║
+	  ║  This can happen after ChromeOS recovery (e.g., after chrx       ║
+	  ║  partition resize). Without a payload, you won't be able to      ║
+	  ║  boot Linux after installation!                                  ║
+	  ║                                                                  ║
+	  ║  Please run the MrChromebox firmware utility first:              ║
+	  ║    cd; curl -LO mrchromebox.tech/firmware-util.sh && sudo bash   ║
+	  ║    firmware-util.sh                                              ║
+	  ║                                                                  ║
+	  ║  Select option 1 (Install/Update RW_LEGACY Firmware) then        ║
+	  ║  run chrx again.                                                 ║
+	  ╚══════════════════════════════════════════════════════════════════╝
+	${ANSI_RST}
+	EOMSG
+
+    echo_warn "Continue anyway? (If you're sure the payload is installed)"
+    echo_warn "Type 'yes' to continue or press Enter to exit: \c"
+    prompt_if_interactive
+    if [ "${PROMPT_RESPONSE}" != "yes" ]; then
+      echo_fail "\nExiting. Please install MrChromebox firmware first."
+      ping_chrx_org "fail_no_payload"
+      exit 1
+    fi
+    echo_warn "Continuing at user request..."
+  fi
+}
+
 setup_and_validate_environment()
 {
 
@@ -648,11 +726,10 @@ setup_and_validate_environment()
   fi
 
   if [ "$CHRX_HOST_IS_CHROMEOS" ]; then
-    :
-    # disabled, redundant after hwid check
-    #check_support_for_legacy_boot
+    ## Check for AltFw payload - critical after ChromeOS recovery
+    check_altfw_payload
   else
-    echo_warn "Skipping legacy boot check, because this is not ChromeOS."
+    echo_warn "Skipping firmware payload check, because this is not ChromeOS."
   fi
 }
 
