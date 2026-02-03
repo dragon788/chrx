@@ -666,21 +666,23 @@ check_altfw_payload()
 	  ║  partition resize). Without a payload, you won't be able to      ║
 	  ║  boot Linux after installation!                                  ║
 	  ║                                                                  ║
-	  ║  Please run the MrChromebox firmware utility first:              ║
-	  ║    cd; curl -LO mrchromebox.tech/firmware-util.sh && sudo bash   ║
-	  ║    firmware-util.sh                                              ║
+	  ║  Options:                                                        ║
+	  ║  1. Run MrChromebox firmware utility to install RW_LEGACY:       ║
+	  ║       cd; curl -LO mrchromebox.tech/firmware-util.sh             ║
+	  ║       sudo bash firmware-util.sh                                 ║
+	  ║     Select option 1 (Install/Update RW_LEGACY Firmware)          ║
 	  ║                                                                  ║
-	  ║  Select option 1 (Install/Update RW_LEGACY Firmware) then        ║
-	  ║  run chrx again.                                                 ║
+	  ║  2. If you plan to install UEFI Full ROM firmware AFTER chrx,    ║
+	  ║     you may continue - Full ROM replaces the bootloader.         ║
 	  ╚══════════════════════════════════════════════════════════════════╝
 	${ANSI_RST}
 	EOMSG
 
-    echo_warn "Continue anyway? (If you're sure the payload is installed)"
+    echo_warn "Continue anyway? (e.g., planning Full ROM install later)"
     echo_warn "Type 'yes' to continue or press Enter to exit: \c"
     prompt_if_interactive
     if [ "${PROMPT_RESPONSE}" != "yes" ]; then
-      echo_fail "\nExiting. Please install MrChromebox firmware first."
+      echo_fail "\nExiting. Please install firmware first."
       ping_chrx_org "fail_no_payload"
       exit 1
     fi
