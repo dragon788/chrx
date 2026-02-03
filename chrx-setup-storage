@@ -21,6 +21,73 @@ set_root_partition() {
   esac
 }
 
+set_efi_partition() {
+  ## EFI System Partition is partition 12 on ChromeOS devices
+  pnum=12
+
+  case "$CHRX_TARGET_DISK" in
+    /dev/sd*)     CHRX_EFI_PARTITION="${CHRX_TARGET_DISK}${pnum}" ;;
+    /dev/mmcblk*) CHRX_EFI_PARTITION="${CHRX_TARGET_DISK}p${pnum}" ;;
+    /dev/nvme*)   CHRX_EFI_PARTITION="${CHRX_TARGET_DISK}p${pnum}" ;;
+    *) CHRX_EFI_PARTITION="" ;;
+  esac
+}
+
+is_uefi_system() {
+  ## Check if system is booted in UEFI mode
+  [ -d /sys/firmware/efi ]
+}
+
+setup_efi_partition() {
+  ## Set up the EFI System Partition (partition 12)
+  ## This partition is created by ChromeOS and can be reused for Linux EFI boot
+
+  if ! is_uefi_system; then
+    echo_info "System booted in Legacy/BIOS mode, skipping EFI partition setup."
+    CHRX_EFI_PARTITION=""
+    return 0
+  fi
+
+  set_efi_partition
+
+  if [ -z "${CHRX_EFI_PARTITION}" ]; then
+    echo_warn "Could not determine EFI partition for disk ${CHRX_TARGET_DISK}"
+    return 1
+  fi
+
+  if [ ! -b "${CHRX_EFI_PARTITION}" ]; then
+    echo_warn "EFI partition ${CHRX_EFI_PARTITION} does not exist"
+    CHRX_EFI_PARTITION=""
+    return 1
+  fi
+
+  echo_info "Setting up EFI System Partition ${CHRX_EFI_PARTITION}..."
+
+  ## Unmount if already mounted
+  umount -f ${CHRX_EFI_PARTITION} 2>/dev/null
+
+  ## Format as FAT32 for EFI compatibility
+  echo_info "Formatting ${CHRX_EFI_PARTITION} as FAT32 for EFI..."
+  mkfs.vfat -F 32 -n EFI ${CHRX_EFI_PARTITION}
+
+  ## Create mount point and mount
+  mkdir -p ${CHRX_INSTALL_ROOT}/boot/efi
+  mount -t vfat ${CHRX_EFI_PARTITION} ${CHRX_INSTALL_ROOT}/boot/efi
+
+  if [ $? -eq 0 ]; then
+    echo_info "EFI partition mounted at ${CHRX_INSTALL_ROOT}/boot/efi"
+
+    ## Create standard EFI directory structure
+    mkdir -p ${CHRX_INSTALL_ROOT}/boot/efi/EFI/BOOT
+
+    return 0
+  else
+    echo_warn "Failed to mount EFI partition"
+    CHRX_EFI_PARTITION=""
+    return 1
+  fi
+}
+
 if [ "${CHRX_TARGET_DISK}" ]; then
   echo_info "Installing to target disk ${ANSI_WHT}${CHRX_TARGET_DISK}${ANSI_RST}"
   cat <<- EOF
@@ -110,6 +177,33 @@ else
     echo "  rootc_start    ${rootc_start}"
     echo "  rootc_size     ${rootc_size}"
 
+    ## WARNING: Confirm BEFORE modifying partition table
+    cat <<- EOF
+	${ANSI_RED}
+	  ╔══════════════════════════════════════════════════════════════════╗
+	  ║                         *** WARNING ***                          ║
+	  ╠══════════════════════════════════════════════════════════════════╣
+	  ║  This will modify the partition table on ${CHRX_TARGET_DISK}
+	  ║                                                                  ║
+	  ║  After this change:                                              ║
+	  ║    - ChromeOS will detect the modification on next boot          ║
+	  ║    - You will see "ChromeOS is missing or damaged" message       ║
+	  ║    - ChromeOS will perform a recovery/powerwash                  ║
+	  ║    - ALL USER DATA IN CHROMEOS WILL BE ERASED                    ║
+	  ║                                                                  ║
+	  ║  Make sure you have backed up any important data before          ║
+	  ║  proceeding!                                                     ║
+	  ╚══════════════════════════════════════════════════════════════════╝
+	${ANSI_RST}
+	EOF
+
+    echo_warn "Type 'yes' to confirm you have backed up your data and wish to proceed: \c"
+    prompt_if_interactive
+    if [ "${PROMPT_RESPONSE}" != "yes" ]; then
+      echo_fail "\nPartition modification cancelled. No changes have been made."
+      exit 1
+    fi
+
     ## Do the real work
     echo_info "\n\nModifying partition table to make room for Linux."
 
@@ -120,12 +214,14 @@ else
 
     cat <<- EOF
 		${ANSI_GRN}
-		Your Chromebook will reboot and clear your data.
+		Partition table has been modified successfully.
 
-		Run chrx again to install Linux.
+		Your Chromebook will now reboot and ChromeOS will clear your data.
+
+		Run chrx again after reboot to install Linux.
 		${ANSI_RST}
 		EOF
-    echo_warn "Press [enter] to continue: \c"
+    echo_warn "Press [enter] to reboot: \c"
     prompt_if_interactive
 
     ## reboot without dropping user to shell
@@ -166,6 +262,9 @@ if [ ! -d "${CHRX_INSTALL_ROOT}" ]; then
 fi
 
 eval_crit mount -t ext4 ${CHRX_ROOT_PARTITION} ${CHRX_INSTALL_ROOT}
+
+## Set up EFI partition if system is UEFI-booted
+setup_efi_partition
 
 ## clear error variable, which is checked in the calling script
 SETUP_STORAGE_ERROR=""
