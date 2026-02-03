@@ -581,8 +581,13 @@ galliumos_update_core_image()
   APT_DB_NEEDS_UPDATE=1
 }
 
-is_uefi_system() {
-  ## Check if system is booted in UEFI mode
+is_efi_enabled() {
+  ## Check if EFI mode is enabled
+  ## Priority: 1) explicit -E flag (CHRX_USE_EFI), 2) detected UEFI boot environment
+  if [ "${CHRX_USE_EFI}" ]; then
+    return 0
+  fi
+  ## Fallback: check if currently booted in UEFI mode
   [ -d /sys/firmware/efi ]
 }
 
@@ -597,7 +602,7 @@ write_default_fstab()
   echo "${CHRX_ROOT_PARTITION} / ext4 defaults,discard,relatime 1 1" >> /etc/fstab
 
   ## Add EFI partition to fstab if UEFI system and partition is set
-  if is_uefi_system && [ -n "${CHRX_EFI_PARTITION}" ]; then
+  if is_efi_enabled && [ -n "${CHRX_EFI_PARTITION}" ]; then
     echo_title "Adding EFI partition to fstab..."
     echo "${CHRX_EFI_PARTITION} /boot/efi vfat umask=0077 0 1" >> /etc/fstab
     ## Ensure mount point exists
@@ -627,7 +632,7 @@ install_grub()
     echo_title_yel "(skipping chrx grub config)"
   fi
 
-  if is_uefi_system && [ -n "${CHRX_EFI_PARTITION}" ]; then
+  if is_efi_enabled && [ -n "${CHRX_EFI_PARTITION}" ]; then
     echo_title "Installing GRUB for UEFI boot..."
     ## Install GRUB EFI packages
     apt_get_install grub-efi-amd64 grub-efi-amd64-signed shim-signed
@@ -670,7 +675,7 @@ GRUB_DISABLE_RECOVERY="true"
 GRUB_DISABLE_LINUX_UUID="true"
 EOF
 
-  if is_uefi_system && [ -n "${CHRX_EFI_PARTITION}" ]; then
+  if is_efi_enabled && [ -n "${CHRX_EFI_PARTITION}" ]; then
     echo_title "Installing GRUB2 for UEFI boot..."
     ## For Fedora UEFI, install shim and grub2-efi packages
     ## This is the recommended method per Fedora documentation

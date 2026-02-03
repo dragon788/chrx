@@ -33,20 +33,32 @@ set_efi_partition() {
   esac
 }
 
-is_uefi_system() {
-  ## Check if system is booted in UEFI mode
+is_efi_enabled() {
+  ## Check if EFI mode is enabled
+  ## Priority: 1) explicit -E flag, 2) detected UEFI boot environment
+  if [ "${CHRX_USE_EFI}" ]; then
+    return 0
+  fi
+  ## Fallback: check if currently booted in UEFI mode
+  ## (useful when running from a UEFI-booted live environment)
   [ -d /sys/firmware/efi ]
 }
 
 setup_efi_partition() {
   ## Set up the EFI System Partition (partition 12)
   ## This partition is created by ChromeOS and can be reused for Linux EFI boot
+  ##
+  ## EFI mode requires UEFI firmware (e.g. MrChromebox full ROM)
+  ## Use -E flag to enable, or auto-detected if booted in UEFI mode
 
-  if ! is_uefi_system; then
-    echo_info "System booted in Legacy/BIOS mode, skipping EFI partition setup."
+  if ! is_efi_enabled; then
+    echo_info "EFI mode not enabled. Using Legacy/BIOS boot."
+    echo_info "(Use -E flag if you have UEFI firmware installed)"
     CHRX_EFI_PARTITION=""
     return 0
   fi
+
+  echo_info "EFI mode enabled. Setting up UEFI boot..."
 
   set_efi_partition
 

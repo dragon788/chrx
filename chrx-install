@@ -34,6 +34,7 @@ CHRX_PROMPT_ENABLED=1
 CHRX_NOTIFY_ENABLED=1
 CHRX_CUSTOMIZATION_ENABLED=1
 CHRX_CONFIGURE_GRUB_ENABLED=
+CHRX_USE_EFI=
 
 USAGE="
 chrx installer, version ${CHRX_VERSION}
@@ -65,6 +66,7 @@ Options
    -L LOCALE       locale for new system [${CHRX_LOCALE}]
    -Z TIMEZONE     timezone for new system, Eggert convention [${CHRX_TZ}]
                      America/San_Francisco, Europe/Amsterdam, Etc/UTC, etc
+   -E              enable EFI/UEFI boot (requires UEFI firmware, e.g. MrChromebox)
    -n              disable success/failure notifications
    -s              skip all customization, install stock OS only
    -y              run non-interactively, take defaults and do not confirm
@@ -897,7 +899,7 @@ do_install()
   export CHRX_CUSTOMIZATION_ENABLED
   export CHRX_OS_DISTRO_DISPLAYNAME CHRX_HWCPUF
   export CHRX_TZ CHRX_LOCALE CHRX_USERNAME
-  export CHRX_TARGET_DISK CHRX_ROOT_PARTITION CHRX_EFI_PARTITION CHRX_CACHE_DIR CHRX_INSTALL_ROOT
+  export CHRX_TARGET_DISK CHRX_ROOT_PARTITION CHRX_EFI_PARTITION CHRX_USE_EFI CHRX_CACHE_DIR CHRX_INSTALL_ROOT
   export CHRX_OS_RELEASE CHRX_ADD_PKGS CHRX_CONFIGURE_GRUB_ENABLED
   export VERBOSITY VERBOSITY_APTGET VERBOSITY_CURL VERBOSITY_DNF
   export ANSI_RED ANSI_YEL ANSI_GRN ANSI_VIO ANSI_BLU ANSI_WHT ANSI_RST
@@ -953,7 +955,7 @@ parse_opts()
 {
   ## parse command line options
   ## TODO: lubuntu[-desktop[-latest]] should be parseable
-  while getopts ":d:e:r:a:m:t:p:H:U:L:Z:nsyvh" OPTION
+  while getopts ":d:e:r:a:m:t:p:H:U:L:Z:Ensyvh" OPTION
   do
     case "$OPTION" in
       d) CHRX_OS_DISTRO=$(downcase $OPTARG) ;;
@@ -967,6 +969,7 @@ parse_opts()
       U) CHRX_USERNAME=$OPTARG ;;
       L) CHRX_LOCALE=$OPTARG ;;
       Z) CHRX_TZ=$OPTARG ;;
+      E) CHRX_USE_EFI=1 ;;
       n) CHRX_NOTIFY_ENABLED= ;;
       s) CHRX_CUSTOMIZATION_ENABLED= ;;
       y) CHRX_PROMPT_ENABLED= ;;
