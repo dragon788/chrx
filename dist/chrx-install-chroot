@@ -598,9 +598,28 @@ write_default_fstab()
   ## Add EFI partition to fstab if UEFI system and partition is set
   if is_efi_bootloader && [ -n "${CHRX_EFI_PARTITION}" ]; then
     echo_title "Adding EFI partition to fstab..."
-    echo "${CHRX_EFI_PARTITION} /boot/efi vfat umask=0077 0 1" >> /etc/fstab
+    ## fsck pass MUST be 0 and nofail MUST be set. On eMMC ChromeOS-x86 boxes the
+    ## EFI device node can enumerate AFTER OpenRC localmount runs fsck.fat, which
+    ## then aborts boot ("Filesystems couldn't be fixed -> rc: Aborting!") and
+    ## prevents networking/sshd from starting. The ESP is only read by edk2/grub
+    ## PRE-OS, never at runtime, so skip the boot-time fsck (pass 0) and make a
+    ## missing node non-fatal (nofail). Do NOT "fix" this back to pass=1.
+    echo "${CHRX_EFI_PARTITION} /boot/efi vfat umask=0077,nofail 0 0" >> /etc/fstab
     ## Ensure mount point exists
     mkdir -p /boot/efi
+  fi
+
+  ## Idempotent safety net (same fsck-race rationale as above): force ANY existing
+  ## /boot/efi entry to nofail + fsck pass 0. No-op if already correct; otherwise
+  ## keep a timestamped .bak before rewriting. Covers pre-existing fstabs and any
+  ## future path that re-emits the line with a nonzero pass.
+  if [ -f /etc/fstab ] && grep -qE '[[:space:]]/boot/efi[[:space:]]' /etc/fstab; then
+    if ! grep -qE '[[:space:]]/boot/efi[[:space:]].*nofail.*[[:space:]]0[[:space:]]+0[[:space:]]*$' /etc/fstab; then
+      cp -a /etc/fstab "/etc/fstab.bak.$(date +%s)"
+      awk '$2=="/boot/efi"{ o=$4; if(o !~ /(^|,)nofail($|,)/) o=o",nofail"; print $1, $2, $3, o, "0", "0"; next } {print}' \
+        /etc/fstab > /etc/fstab.chrx.tmp && mv /etc/fstab.chrx.tmp /etc/fstab
+      echo_title "Normalized /boot/efi fstab entry to nofail + fsck pass 0 (fsck-race fix)"
+    fi
   fi
 }
 
