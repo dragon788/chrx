@@ -22,9 +22,36 @@ set_root_partition() {
 }
 
 set_efi_partition() {
-  ## EFI System Partition is partition 12 on ChromeOS devices
-  pnum=12
+  ## Find the EFI System Partition on the target disk.
+  ## Preferred: use blkid to find by PARTLABEL (works even when
+  ## the kernel hasn't created /dev/sdaN device nodes yet).
+  ## Fallback: construct from partition number 12 (ChromeOS default).
 
+  ## Try blkid first — most robust across disk types
+  local _efi_dev
+  _efi_dev=$(blkid --match-token PARTLABEL=EFI-SYSTEM -o device 2>/dev/null \
+    | grep "^${CHRX_TARGET_DISK}" | head -1)
+
+  if [ -n "$_efi_dev" ] && [ -b "$_efi_dev" ]; then
+    CHRX_EFI_PARTITION="$_efi_dev"
+    return 0
+  fi
+
+  ## blkid didn't find it — force kernel to re-read partition table
+  partprobe ${CHRX_TARGET_DISK} 2>/dev/null
+  sleep 1
+
+  ## Retry blkid after partprobe
+  _efi_dev=$(blkid --match-token PARTLABEL=EFI-SYSTEM -o device 2>/dev/null \
+    | grep "^${CHRX_TARGET_DISK}" | head -1)
+
+  if [ -n "$_efi_dev" ] && [ -b "$_efi_dev" ]; then
+    CHRX_EFI_PARTITION="$_efi_dev"
+    return 0
+  fi
+
+  ## Final fallback: construct from partition 12 (ChromeOS default)
+  local pnum=12
   case "$CHRX_TARGET_DISK" in
     /dev/sd*)     CHRX_EFI_PARTITION="${CHRX_TARGET_DISK}${pnum}" ;;
     /dev/mmcblk*) CHRX_EFI_PARTITION="${CHRX_TARGET_DISK}p${pnum}" ;;
@@ -132,7 +159,75 @@ else
   max_os_size=$((${state_size}/1024/1024/2))
   rec_os_size=$((${max_os_size} - 1))
   # If KERN-C and ROOT-C are one, we partition, otherwise assume they're what they need to be...
-  if [ "${ckern_size}" = "1" -o "${croot_size}" = "1" ]; then
+  if [ "${CHRX_SKIP_PARTITIONING}" = "1" ] && [ "${ckern_size}" = "1" -o "${croot_size}" = "1" ]; then
+    ## Skip-partitioning mode: set up KERN-C and ROOT-C in free space
+    ## without rebooting. Used with external partitioning tools like CRaP
+    ## (ChromeOS Automated Partitioning) that shrink the stateful partition
+    ## but leave KERN-C/ROOT-C at 1 sector.
+    ##
+    ## We do the same partition math as chrx's normal "first pass" but use
+    ## partx -u to update the kernel's partition table instead of rebooting.
+    ## This allows the install to continue in a single pass.
+
+    echo_info "CHRX_SKIP_PARTITIONING is set -- setting up partitions without reboot."
+
+    ## CRaP has ALREADY shrunk STATE (both the partition AND its filesystem) and
+    ## left free space after it. STATE is FINAL -- we must NOT touch -i 1, or we
+    ## would shrink the partition below its (CRaP-resized) filesystem and trigger a
+    ## ChromeOS "missing or damaged" recovery powerwash on the next ChromeOS boot.
+    ## So here we ONLY carve KERN-C + ROOT-C out of the free space AFTER STATE.
+
+    kernc_size=32768 # kernc is always 16MB
+
+    ## existing STATE geometry (already-final from CRaP) -- read, never rewrite.
+    ## ${state_size} was read above via `cgpt show -i 1 -s`; leave STATE alone.
+    stateful_start="`cgpt show -i 1 -n -b -q ${CHRX_TARGET_DISK}`"
+
+    ## KERN-C / ROOT-C go immediately after the existing STATE partition
+    kernc_start=$((${stateful_start} + ${state_size}))
+    rootc_start=$((${kernc_start} + ${kernc_size}))
+
+    ## ROOT-C fills the remaining free space up to the last usable sector.
+    ## Reserve 34 sectors at the end for the secondary GPT (header + 32 entries).
+    disk_total_sectors="`blockdev --getsz ${CHRX_TARGET_DISK} 2>/dev/null`"
+    if [ -z "${disk_total_sectors}" ]; then
+      ## fallback: derive from cgpt's reported secondary GPT table location
+      disk_total_sectors=$(( `cgpt show ${CHRX_TARGET_DISK} | awk '/Sec GPT table/{print $1; exit}'` + 33 ))
+    fi
+    rootc_size=$((${disk_total_sectors} - ${rootc_start} - 34))
+
+    echo "  stateful_start ${stateful_start} (unchanged)"
+    echo "  state_size     ${state_size} (unchanged -- STATE NOT re-shrunk)"
+    echo "  kernc_start    ${kernc_start}"
+    echo "  kernc_size     ${kernc_size}"
+    echo "  rootc_start    ${rootc_start}"
+    echo "  rootc_size     ${rootc_size}"
+
+    ## Sanity guard (ewspikvm review): if CRaP didn't free enough space after STATE,
+    ## rootc_size can come out tiny/negative -- cgpt would then create a junk ROOT-C
+    ## or fail outright. Abort cleanly BEFORE touching the partition table.
+    min_rootc_size=2097152 # ~1 GiB floor for a usable Linux root
+    if [ "${rootc_size}" -lt "${min_rootc_size}" ]; then
+      echo_fail "ROOT-C free space too small: ${rootc_size} sectors (need >= ${min_rootc_size})."
+      echo_fail "CRaP left insufficient free space after STATE -- shrink STATE further, then re-run."
+      exit 1
+    fi
+
+    ## Carve KERN-C + ROOT-C into the free space ONLY. STATE (-i 1) is untouched.
+    umount -f /mnt/stateful_partition > /dev/null 2>&1
+    cgpt add -i 6 -b ${kernc_start} -s ${kernc_size} -l KERN-C -t "kernel" ${CHRX_TARGET_DISK}
+    cgpt add -i 7 -b ${rootc_start} -s ${rootc_size} -l ROOT-C ${CHRX_TARGET_DISK}
+
+    ## Instead of rebooting, tell the kernel to re-read the partition table.
+    ## This is the same approach CRaP uses after resizing partitions.
+    echo_info "Updating kernel partition table (partx -u)..."
+    partx -u ${CHRX_TARGET_DISK}
+
+    echo_info "Partitions configured without reboot. Continuing to install..."
+
+    ## Fall through to formatting/mounting below (the "second pass" path)
+
+  elif [ "${ckern_size}" = "1" -o "${croot_size}" = "1" ]; then
     while :
     do
       cat <<- EOF
@@ -256,17 +351,34 @@ if [ "`mount | grep ${CHRX_ROOT_PARTITION}`" ]; then
   exit 1
 fi
 
-eval_crit mkfs.ext4 ${VERBOSITY_MKFS} ${CHRX_ROOT_PARTITION}
-
-echo_info "Preparing installation root directory ${CHRX_INSTALL_ROOT}"
-rm -rf ${CHRX_INSTALL_ROOT}
+## Idempotency: if ROOT-C already holds an OS install, reuse it (skip format +
+## rootfs extract) so chrx can be re-run to redo only later stages (chroot/grub)
+## without wiping a good install. Set CHRX_FORCE_FORMAT=1 to wipe & reinstall.
+CHRX_SKIP_ROOTFS=
 mkdir -p ${CHRX_INSTALL_ROOT}
-if [ ! -d "${CHRX_INSTALL_ROOT}" ]; then
-  echo_fail "fatal: Unable to create installation root directory!"
-  exit 1
+_rootc_fstype=`blkid -p -s TYPE -o value ${CHRX_ROOT_PARTITION} 2>/dev/null`
+if [ -z "${CHRX_FORCE_FORMAT}" ] && [ "${_rootc_fstype}" = "ext4" ] \
+   && mount -t ext4 ${CHRX_ROOT_PARTITION} ${CHRX_INSTALL_ROOT} 2>/dev/null \
+   && { [ -e "${CHRX_INSTALL_ROOT}/etc/os-release" ] \
+        || [ -d "${CHRX_INSTALL_ROOT}/etc/apk" ] \
+        || [ -x "${CHRX_INSTALL_ROOT}/sbin/init" ]; }; then
+  echo_info "${CHRX_ROOT_PARTITION} already holds an install -- reusing (skip format + rootfs)."
+  echo_info "  (set CHRX_FORCE_FORMAT=1 to wipe and reinstall from scratch.)"
+  CHRX_SKIP_ROOTFS=1
+else
+  ## no existing install (or forced) -- format fresh and mount
+  umount ${CHRX_INSTALL_ROOT} 2>/dev/null
+  eval_crit mkfs.ext4 ${VERBOSITY_MKFS} -F ${CHRX_ROOT_PARTITION}
+  echo_info "Preparing installation root directory ${CHRX_INSTALL_ROOT}"
+  rm -rf ${CHRX_INSTALL_ROOT}
+  mkdir -p ${CHRX_INSTALL_ROOT}
+  if [ ! -d "${CHRX_INSTALL_ROOT}" ]; then
+    echo_fail "fatal: Unable to create installation root directory!"
+    exit 1
+  fi
+  eval_crit mount -t ext4 ${CHRX_ROOT_PARTITION} ${CHRX_INSTALL_ROOT}
 fi
-
-eval_crit mount -t ext4 ${CHRX_ROOT_PARTITION} ${CHRX_INSTALL_ROOT}
+export CHRX_SKIP_ROOTFS
 
 ## Set up EFI partition if system is UEFI-booted
 setup_efi_partition
