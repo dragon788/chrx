@@ -4,3 +4,9 @@
 *.swp
 util/
 dist.tar.gz
+
+# External upstream tool (github.com/chrultrabook/crap) — vendored reference, fetched not committed
+crap.sh
+# Session/device bootstrap scratch (faffy/teemo SSH + pmOS setup one-offs) — not chrx code
+teemo_*.sh
+teemo_*.pub
