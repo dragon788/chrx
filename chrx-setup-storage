@@ -214,7 +214,17 @@ else
     fi
 
     ## Carve KERN-C + ROOT-C into the free space ONLY. STATE (-i 1) is untouched.
-    umount -f /mnt/stateful_partition > /dev/null 2>&1
+    ##
+    ## NOTE: we deliberately do NOT unmount /mnt/stateful_partition here. The
+    ## non-skip branch unmounts it because it rewrites STATE (-i 1) in place; this
+    ## branch only ADDS partitions in the free space after STATE, so STATE never
+    ## changes and can stay mounted. Keeping it mounted means a `chrx -S` run
+    ## driven over SSH does NOT lose its session (the SSH user's $HOME and shill's
+    ## state live on stateful) -- enabling a true single-pass, no-reboot resize.
+    ## `partx -u` below registers the new KERN-C/ROOT-C nodes while STATE stays up.
+    ## If a target's `partx -u` refuses to add partitions while the disk is busy,
+    ## fall back to: setsid/nohup the chrx run so it survives the dropped session,
+    ## umount -f stateful, partx -u, then restart shill to remount + restore net.
     cgpt add -i 6 -b ${kernc_start} -s ${kernc_size} -l KERN-C -t "kernel" ${CHRX_TARGET_DISK}
     cgpt add -i 7 -b ${rootc_start} -s ${rootc_size} -l ROOT-C ${CHRX_TARGET_DISK}
 
