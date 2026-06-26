@@ -25,6 +25,11 @@ mkdir -p etc/chrx-files
 mv ./bin/chrx-devices ./etc/
 rm -rf $chrx_src/dist/etc/etc/
 cp -r "$chrx_src/dist/etc" ./etc/chrx-files/
+# bundle the pmOS apk signing key — chrx-install-chroot uses this as a fallback
+# when the live fetch from gitlab.postmarketos.org fails. Lands at top level so
+# it extracts to ${CHRX_CACHE_DIR}/keys/ inside the chroot.
+mkdir -p keys
+cp "$chrx_src/dist/keys/"* ./keys/
 cd $chrx_src
 # NEED_TEST
 # Strip macOS extended attributes (com.apple.provenance et al) that the OS

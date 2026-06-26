@@ -850,12 +850,28 @@ EOF
   case "${CHRX_OS_DISTRO}" in
     pmos|postmarketos)
       echo "${CHRX_PMOS_REPO}" >> /etc/apk/repositories
-      ## pmOS binary repo is signed — trust its key, else apk needs --allow-untrusted
+      ## pmOS binary repo is signed — trust its key, else apk needs --allow-untrusted.
+      ## Strategy: fetch the CURRENT key (so an upstream key rotation is picked up),
+      ## and fall back to the copy bundled in the chrx dist if the fetch fails.
+      ## Two gotchas this works around:
+      ##   - the Alpine minirootfs ships busybox WGET, not curl, so use wget;
+      ##   - postmarketOS moved off gitlab.com to their own instance
+      ##     (gitlab.postmarketos.org, default branch 'main', keys now live under
+      ##     main/postmarketos-keys/), so the old gitlab.com/.../master/keys URL 404s.
       mkdir -p /etc/apk/keys
-      curl -s -o /etc/apk/keys/build.postmarketos.org.rsa.pub \
-        https://gitlab.com/postmarketOS/pmaports/-/raw/master/keys/build.postmarketos.org.rsa.pub \
-        2>/dev/null \
-        || echo_title_yel "WARN: could not fetch pmOS signing key; pmOS repo will be untrusted."
+      _pmos_key=/etc/apk/keys/build.postmarketos.org.rsa.pub
+      _pmos_key_url="https://gitlab.postmarketos.org/postmarketOS/pmaports/-/raw/main/main/postmarketos-keys/build.postmarketos.org.rsa.pub"
+      _pmos_key_bundled="${CHRX_CACHE_DIR}/keys/build.postmarketos.org.rsa.pub"
+      if wget -q -O "${_pmos_key}" "${_pmos_key_url}" 2>/dev/null \
+         && grep -q 'BEGIN PUBLIC KEY' "${_pmos_key}" 2>/dev/null; then
+        echo_title "Fetched current pmOS signing key."
+      elif [ -s "${_pmos_key_bundled}" ]; then
+        echo_title_yel "pmOS key fetch failed; using bundled copy."
+        cp "${_pmos_key_bundled}" "${_pmos_key}"
+      else
+        rm -f "${_pmos_key}"
+        echo_title_yel "WARN: no pmOS signing key (fetch failed, no bundle); pmOS repo will be untrusted."
+      fi
       ;;
   esac
 }
@@ -899,10 +915,19 @@ pmos_install_overlay()
     *) return 0 ;;
   esac
   echo_title "Installing postmarketOS overlay (base + device-generic-x86_64)."
-  if ! apk --no-cache add postmarketos-base device-generic-x86_64; then
-    echo_title_yel "Retrying pmOS base with --allow-untrusted."
-    apk --no-cache --allow-untrusted add postmarketos-base device-generic-x86_64 \
-      || echo_title_red "WARN: pmOS base install failed — check repo/key/network."
+  apk --no-cache update
+  ## postmarketos-base conflicts with alpine-base, and postmarketos-mkinitfs
+  ## conflicts with Alpine's mkinitfs; apk will NOT auto-replace, so we must
+  ## remove the Alpine equivalents first (postmarketos-base re-provides them).
+  ## Guard: only delete them if postmarketos-base is actually available (i.e. the
+  ## pmOS repo is trusted + indexed) — otherwise we'd strip the base and leave a
+  ## broken system; if not available we just stay on the Alpine base.
+  if apk --no-cache list postmarketos-base 2>/dev/null | grep -q '^postmarketos-base-'; then
+    apk --no-cache del --no-scripts alpine-base mkinitfs 2>/dev/null || true
+    apk --no-cache add postmarketos-base postmarketos-mkinitfs device-generic-x86_64 \
+      || echo_title_red "WARN: pmOS base install failed — check repo/network."
+  else
+    echo_title_red "WARN: postmarketos-base not found (pmOS repo untrusted/unreachable?); staying on Alpine base."
   fi
   case "${CHRX_OS_ENVIRONMENT}" in
     sxmo-de-sway)
