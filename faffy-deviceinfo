@@ -1,0 +1,39 @@
+# postmarketOS deviceinfo — ASUS Chromebox 4 Commercial (faffy)
+# Hand-authored profile for the puff-family ChromeOS x86_64 boxes.
+# Intended to be upstreamed as device-asus-faffy (pmaports).
+# Reference: https://wiki.postmarketos.org/wiki/Deviceinfo_reference
+deviceinfo_format_version="0"
+deviceinfo_name="ASUS Chromebox 4 Commercial"
+deviceinfo_manufacturer="ASUS"
+deviceinfo_codename="asus-faffy"
+deviceinfo_year="2020"
+deviceinfo_dtb=""
+deviceinfo_arch="x86_64"
+
+# Device related
+deviceinfo_chassis="desktop"
+deviceinfo_keyboard="true"
+deviceinfo_external_storage="true"
+deviceinfo_gpu_accelerated="true"
+deviceinfo_screen_width="1920"
+deviceinfo_screen_height="1080"
+
+# Bootloader related
+# IMPORTANT: pmOS-rd (postmarketos-mkinitfs) locates the rootfs via the cmdline
+# param `pmos_root_uuid=<ROOT-C UUID>` — it IGNORES a bare `root=UUID=`. Set this
+# to THIS install's ROOT-C ext4 UUID (the chrx conversion injects the real UUID;
+# the value below is faffy's as-shipped ROOT-C). Without pmos_root_uuid, pmOS-rd
+# falls through to the 'pmOS_root' partition label / subpartition scan and dies
+# with "failed to mount subpartitions!".
+#
+# NOTE: the matching boot fix for the EFI partition (nofail + fsck pass 0, to
+# avoid an eMMC-enumeration fsck-race boot abort) is NOT a deviceinfo setting —
+# it lives in the fstab written by chrx (dist/chrx-install-chroot write_default_fstab()).
+deviceinfo_kernel_cmdline="console=tty1 rootwait pmos_root_uuid=3bbae946-44c9-4818-a152-dfc5400f8417"
+deviceinfo_generate_grub_config="true"
+deviceinfo_generate_systemd_boot="false"
+deviceinfo_generate_extlinux_config="false"
+deviceinfo_generate_uboot_fit_images="false"
+
+# initramfs / modules (CometLake-U, eMMC + NVMe + SATA; ext4 root)
+deviceinfo_modules_initfs="sdhci_pci mmc_block nvme ahci sd_mod ext4 i915"

@@ -5,6 +5,12 @@
 # This portion of the installation process is run in a chroot.
 #
 
+## Prevent dpkg config prompts from blocking unattended installs
+export DEBIAN_FRONTEND=noninteractive
+export DEBCONF_NONINTERACTIVE_SEEN=true
+## Keep existing config files when packages want to overwrite
+export DPKG_OPTIONS="--force-confold --force-confdef"
+
 echo_title() { echo -e "\n${ANSI_GRN}${*}${ANSI_RST}"; }
 echo_title_yel() { echo -e "\n${ANSI_YEL}${*}${ANSI_RST}"; }
 echo_title_red() { echo -e "\n${ANSI_RED}${*}${ANSI_RST}"; }
@@ -33,7 +39,7 @@ ubuntu_update_core_image()
 {
   echo_title "Upgrading Ubuntu core image."
   apt_get_update_if_needed
-  apt-get -y ${VERBOSITY_APTGET} dist-upgrade
+  apt-get -y -o Dpkg::Options::="--force-confold" -o Dpkg::Options::="--force-confdef" ${VERBOSITY_APTGET} dist-upgrade
   apt_get_install ubuntu-minimal
   apt_get_install software-properties-common
 }
@@ -47,12 +53,13 @@ install_curl()
 install_utilities()
 {
   apt_get_update_if_needed
-  apt_get_install zram-config grub-pc
+  ## Install zram and the selected bootloader package
+  apt_get_install zram-config ${CHRX_BOOTLOADER}
 }
 
 apt_get_install()
 {
-  apt-get -y ${VERBOSITY_APTGET} install $*
+  apt-get -y -o Dpkg::Options::="--force-confold" -o Dpkg::Options::="--force-confdef" ${VERBOSITY_APTGET} install $*
 }
 
 install_additional_packages()
@@ -319,6 +326,7 @@ add_first_user()
   local _groups
   case "${CHRX_OS_DISTRO}" in
     fedora) _groups="adm wheel cdrom" ;;
+    alpine|pmos|postmarketos) _groups="wheel adm input video" ;;
     *)      _groups="adm sudo cdrom dip plugdev lpadmin" ;; #sambashare
   esac
   echo_title "Adding user \"${CHRX_USERNAME}\" to groups \"$_groups\"."
@@ -579,6 +587,11 @@ galliumos_update_core_image()
   APT_DB_NEEDS_UPDATE=1
 }
 
+is_efi_bootloader() {
+  ## Check if EFI bootloader is selected
+  [[ "${CHRX_BOOTLOADER}" == *efi* ]]
+}
+
 write_default_fstab()
 {
   ## FIXME be smarter here
@@ -586,7 +599,42 @@ write_default_fstab()
     echo_title_red "Unable to configure default fstab, CHRX_ROOT_PARTITION is unset!"
     return
   fi
+  echo_title "Configuring /etc/fstab..."
   echo "${CHRX_ROOT_PARTITION} / ext4 defaults,discard,relatime 1 1" >> /etc/fstab
+
+  ## Add EFI partition to fstab if UEFI system
+  if is_efi_bootloader; then
+    ## Find EFI partition if not already set
+    if [ -z "${CHRX_EFI_PARTITION}" ]; then
+      find_and_mount_efi_partition
+    fi
+    if [ -n "${CHRX_EFI_PARTITION}" ]; then
+      echo_title "Adding EFI partition to fstab..."
+      ## fsck pass MUST be 0 and nofail MUST be set. On eMMC ChromeOS-x86 boxes the
+      ## EFI device node can enumerate AFTER OpenRC localmount runs fsck.fat, which
+      ## then aborts boot ("Filesystems couldn't be fixed -> rc: Aborting!") and
+      ## prevents networking/sshd from starting. The ESP is only read by edk2/grub
+      ## PRE-OS, never at runtime, so skip the boot-time fsck (pass 0) and make a
+      ## missing node non-fatal (nofail). Do NOT "fix" this back to pass=1.
+      echo "${CHRX_EFI_PARTITION} /boot/efi vfat umask=0077,nofail 0 0" >> /etc/fstab
+      mkdir -p /boot/efi
+    else
+      echo_title_yel "WARNING: No EFI partition found for fstab"
+    fi
+  fi
+
+  ## Idempotent safety net (same fsck-race rationale as above): force ANY existing
+  ## /boot/efi entry to nofail + fsck pass 0. No-op if already correct; otherwise
+  ## keep a timestamped .bak before rewriting. Covers pre-existing fstabs and any
+  ## future path that re-emits the line with a nonzero pass.
+  if [ -f /etc/fstab ] && grep -qE '[[:space:]]/boot/efi[[:space:]]' /etc/fstab; then
+    if ! grep -qE '[[:space:]]/boot/efi[[:space:]].*nofail.*[[:space:]]0[[:space:]]+0[[:space:]]*$' /etc/fstab; then
+      cp -a /etc/fstab "/etc/fstab.bak.$(date +%s)"
+      awk '$2=="/boot/efi"{ o=$4; if(o !~ /(^|,)nofail($|,)/) o=o",nofail"; print $1, $2, $3, o, "0", "0"; next } {print}' \
+        /etc/fstab > /etc/fstab.chrx.tmp && mv /etc/fstab.chrx.tmp /etc/fstab
+      echo_title "Normalized /boot/efi fstab entry to nofail + fsck pass 0 (fsck-race fix)"
+    fi
+  fi
 }
 
 create_fakebins()
@@ -601,9 +649,67 @@ create_fakebins()
   export PATH=/tmp/fakebin:$PATH
 }
 
+find_and_mount_efi_partition()
+{
+  ## Try to find and mount the EFI partition inside the chroot.
+  ## Called when CHRX_EFI_PARTITION is empty but we know we need EFI.
+
+  local _efi_dev=""
+
+  ## Method 1: blkid by PARTLABEL
+  _efi_dev=$(blkid --match-token PARTLABEL=EFI-SYSTEM -o device 2>/dev/null \
+    | grep "^${CHRX_TARGET_DISK}" | head -1)
+
+  ## Method 2: blkid by TYPE=vfat on partition 12
+  if [ -z "$_efi_dev" ]; then
+    local _p12=""
+    case "$CHRX_TARGET_DISK" in
+      /dev/sd*)     _p12="${CHRX_TARGET_DISK}12" ;;
+      /dev/mmcblk*) _p12="${CHRX_TARGET_DISK}p12" ;;
+      /dev/nvme*)   _p12="${CHRX_TARGET_DISK}p12" ;;
+    esac
+    if [ -n "$_p12" ] && [ -b "$_p12" ]; then
+      _efi_dev="$_p12"
+    fi
+  fi
+
+  ## Method 3: cgpt to check if partition 12 exists
+  if [ -z "$_efi_dev" ] && command -v cgpt >/dev/null 2>&1; then
+    local _label=$(cgpt show -i 12 -l ${CHRX_TARGET_DISK} 2>/dev/null)
+    if [ "$_label" = "EFI-SYSTEM" ]; then
+      case "$CHRX_TARGET_DISK" in
+        /dev/sd*)     _efi_dev="${CHRX_TARGET_DISK}12" ;;
+        /dev/mmcblk*) _efi_dev="${CHRX_TARGET_DISK}p12" ;;
+        /dev/nvme*)   _efi_dev="${CHRX_TARGET_DISK}p12" ;;
+      esac
+    fi
+  fi
+
+  if [ -z "$_efi_dev" ]; then
+    echo_title_red "Could not find EFI partition on ${CHRX_TARGET_DISK}"
+    return 1
+  fi
+
+  echo_title "Found EFI partition: ${_efi_dev}"
+  CHRX_EFI_PARTITION="$_efi_dev"
+
+  ## Mount it
+  mkdir -p /boot/efi
+  if ! mountpoint -q /boot/efi; then
+    mount -t vfat ${_efi_dev} /boot/efi
+    if [ $? -ne 0 ]; then
+      ## May need formatting first
+      echo_title_yel "Formatting EFI partition ${_efi_dev}..."
+      mkfs.vfat -F 32 -n EFI ${_efi_dev}
+      mount -t vfat ${_efi_dev} /boot/efi
+    fi
+  fi
+
+  return $?
+}
+
 install_grub()
 {
-  #apt_get_install grub-pc
   ## GRUB: modify boot settings
   ## unfortunately, we have to do this in the chroot.
   if [ "${CHRX_CONFIGURE_GRUB_ENABLED}" ]; then
@@ -611,13 +717,72 @@ install_grub()
   else
     echo_title_yel "(skipping chrx grub config)"
   fi
-  
+
+  echo_title "Installing GRUB (${CHRX_BOOTLOADER})..."
+
+  ## Build grub-install command based on bootloader type
+  local EFI_DIR_CMD=""
+  if is_efi_bootloader; then
+    echo_title "Setting up EFI boot..."
+
+    ## Try to mount EFI partition if not already done
+    if [ -z "${CHRX_EFI_PARTITION}" ] || ! mountpoint -q /boot/efi; then
+      echo_title_yel "EFI partition not pre-mounted, searching..."
+      find_and_mount_efi_partition
+    else
+      ## CHRX_EFI_PARTITION is set, ensure it's mounted
+      if ! mountpoint -q /boot/efi; then
+        mkdir -p /boot/efi
+        mount ${CHRX_EFI_PARTITION} /boot/efi
+      fi
+    fi
+
+    ## Always use x86_64-efi target for EFI bootloader
+    if mountpoint -q /boot/efi; then
+      EFI_DIR_CMD="--removable --target=x86_64-efi --efi-directory=/boot/efi"
+      echo_title "EFI directory: /boot/efi (mounted)"
+    else
+      ## EFI partition not mounted but we still need the right target
+      ## Install to /boot as fallback
+      echo_title_yel "WARNING: EFI partition not mounted, installing to /boot"
+      EFI_DIR_CMD="--removable --target=x86_64-efi --efi-directory=/boot"
+    fi
+  fi
+
+  grub-install ${EFI_DIR_CMD} --boot-directory=/boot ${CHRX_TARGET_DISK} --force
   grub-mkconfig -o /boot/grub/grub.cfg
-  grub-install ${CHRX_TARGET_DISK} --force
-  
-  #echo -e "\n${ANSI_GRN}Purging unwanted pkgs.${ANSI_RST}"
-  #apt-get -y ${VERBOSITY_APTGET} purge openjade openjade1.3 jade tex-common sgml-base
-  #apt-get -y ${VERBOSITY_APTGET} autoremove
+
+  ## Write a chain-loading grub.cfg on the EFI partition so Tianocore's
+  ## GRUB can find the real config on the root partition automatically.
+  if is_efi_bootloader && mountpoint -q /boot/efi; then
+    echo_title "Writing EFI grub.cfg chain-loader..."
+
+    ## Get the UUID of the root partition for search.fs_uuid
+    local _root_uuid=$(blkid -s UUID -o value ${CHRX_ROOT_PARTITION} 2>/dev/null)
+
+    ## Write to both possible locations GRUB looks for config
+    for _cfgdir in /boot/efi/EFI/BOOT /boot/efi/grub; do
+      mkdir -p ${_cfgdir}
+      if [ -n "$_root_uuid" ]; then
+        cat > ${_cfgdir}/grub.cfg << GRUBCFG
+# Auto-generated by chrx — chain-load real grub.cfg from root partition
+search.fs_uuid ${_root_uuid} root
+set prefix=(\$root)/boot/grub
+configfile \$prefix/grub.cfg
+GRUBCFG
+      else
+        ## Fallback: hardcode partition number (less portable but works)
+        local _gpt_num=$(echo ${CHRX_ROOT_PARTITION} | grep -o '[0-9]*$')
+        cat > ${_cfgdir}/grub.cfg << GRUBCFG
+# Auto-generated by chrx — chain-load real grub.cfg from root partition
+set root=(hd0,gpt${_gpt_num})
+set prefix=(\$root)/boot/grub
+configfile \$prefix/grub.cfg
+GRUBCFG
+      fi
+      echo_title "  Wrote ${_cfgdir}/grub.cfg"
+    done
+  fi
 }
 
 fedora_install_grub2()
@@ -633,9 +798,36 @@ GRUB_CMDLINE_LINUX="rhgb quiet intel_pstate=enable i915.modeset=1 tpm_tis.force=
 GRUB_DISABLE_RECOVERY="true"
 GRUB_DISABLE_LINUX_UUID="true"
 EOF
-  dnf ${VERBOSITY_DNF} -y install grub2
+
+  echo_title "Installing GRUB2 (${CHRX_BOOTLOADER})..."
+
+  local EFI_DIR_CMD=""
+  if is_efi_bootloader && [ -n "${CHRX_EFI_PARTITION}" ]; then
+    echo_title "Setting up EFI boot..."
+    ## For Fedora UEFI, install shim and grub2-efi packages
+    dnf ${VERBOSITY_DNF} -y install grub2-efi-x64 grub2-efi-x64-modules shim-x64
+
+    ## Ensure EFI partition is mounted
+    if ! mountpoint -q /boot/efi; then
+      mkdir -p /boot/efi
+      mount ${CHRX_EFI_PARTITION} /boot/efi
+    fi
+
+    ## Create EFI directory structure
+    mkdir -p /boot/efi/EFI/fedora
+    EFI_DIR_CMD="--removable --target=x86_64-efi --efi-directory=/boot/efi"
+  else
+    ## For Fedora Legacy/BIOS boot
+    dnf ${VERBOSITY_DNF} -y install grub2 grub2-pc grub2-pc-modules
+  fi
+
+  grub2-install ${EFI_DIR_CMD} ${CHRX_TARGET_DISK} --force
   grub2-mkconfig -o /boot/grub2/grub.cfg
-  grub2-install ${CHRX_TARGET_DISK} --force
+
+  ## Copy GRUB config to EFI partition for some firmware
+  if is_efi_bootloader; then
+    cp /boot/grub2/grub.cfg /boot/efi/EFI/fedora/ 2>/dev/null || true
+  fi
 }
 
 fedora_set_selinux_autolabel()
@@ -643,6 +835,149 @@ fedora_set_selinux_autolabel()
   if [ -z "${CHRX_CUSTOMIZATION_ENABLED}" ]; then
     touch /.autorelabel
   fi
+}
+
+## ---- Alpine / postmarketOS -----------------------------------------------
+
+alpine_setup_repos()
+{
+  echo_title "Configuring apk repositories (${CHRX_ALPINE_BRANCH})."
+  mkdir -p /etc/apk
+  cat > /etc/apk/repositories <<EOF
+https://dl-cdn.alpinelinux.org/alpine/${CHRX_ALPINE_BRANCH}/main
+https://dl-cdn.alpinelinux.org/alpine/${CHRX_ALPINE_BRANCH}/community
+EOF
+  case "${CHRX_OS_DISTRO}" in
+    pmos|postmarketos)
+      echo "${CHRX_PMOS_REPO}" >> /etc/apk/repositories
+      ## pmOS binary repo is signed — trust its key, else apk needs --allow-untrusted
+      mkdir -p /etc/apk/keys
+      curl -s -o /etc/apk/keys/build.postmarketos.org.rsa.pub \
+        https://gitlab.com/postmarketOS/pmaports/-/raw/master/keys/build.postmarketos.org.rsa.pub \
+        2>/dev/null \
+        || echo_title_yel "WARN: could not fetch pmOS signing key; pmOS repo will be untrusted."
+      ;;
+  esac
+}
+
+alpine_install_base()
+{
+  echo_title "Updating apk index."
+  apk --no-cache update
+  echo_title "Installing Alpine base system + kernel + bootloader."
+  ## linux-firmware-none satisfies the linux-lts firmware dep without the huge
+  ## firmware blob set (fine for a wired server node). bash for chrx scripts.
+  ## doas (+ doas-sudo-shim for a `sudo` compat command) — NOT the sudo
+  ## package: pmOS's postmarketos-base already pulls doas-sudo-shim, and the
+  ## real sudo package would collide with it over /usr/bin/sudo. shadow gives
+  ## useradd/usermod/chpasswd that add_first_user relies on.
+  apk --no-cache add \
+    alpine-base bash \
+    linux-lts linux-firmware-none mkinitfs \
+    e2fsprogs e2fsprogs-extra dosfstools util-linux \
+    grub grub-efi efibootmgr \
+    openrc openssh chrony tzdata shadow doas doas-sudo-shim ifupdown-ng
+}
+
+alpine_setup_doas()
+{
+  ## pmOS already ships a doas rule permitting :wheel (via postmarketos-base),
+  ## so don't touch its config. For plain Alpine, grant the wheel group.
+  case "${CHRX_OS_DISTRO}" in
+    pmos|postmarketos) return 0 ;;
+  esac
+  echo_title "Configuring doas for the wheel group."
+  if [ ! -f /etc/doas.conf ] || ! grep -qE '^permit.*:wheel' /etc/doas.conf 2>/dev/null; then
+    echo 'permit persist :wheel' >> /etc/doas.conf
+  fi
+}
+
+pmos_install_overlay()
+{
+  case "${CHRX_OS_DISTRO}" in
+    pmos|postmarketos) ;;
+    *) return 0 ;;
+  esac
+  echo_title "Installing postmarketOS overlay (base + device-generic-x86_64)."
+  if ! apk --no-cache add postmarketos-base device-generic-x86_64; then
+    echo_title_yel "Retrying pmOS base with --allow-untrusted."
+    apk --no-cache --allow-untrusted add postmarketos-base device-generic-x86_64 \
+      || echo_title_red "WARN: pmOS base install failed — check repo/key/network."
+  fi
+  case "${CHRX_OS_ENVIRONMENT}" in
+    sxmo-de-sway)
+      echo_title "Installing postmarketOS UI: sxmo-de-sway (fleet image)."
+      apk --no-cache add postmarketos-ui-sxmo-de-sway \
+        || apk --no-cache --allow-untrusted add postmarketos-ui-sxmo-de-sway \
+        || echo_title_yel "WARN: sxmo-de-sway UI install failed."
+      ;;
+    *) echo_title "pmOS environment '${CHRX_OS_ENVIRONMENT}' — base only (no UI)." ;;
+  esac
+}
+
+alpine_setup_network()
+{
+  echo_title "Configuring eth0 (DHCP via ifupdown-ng / busybox udhcpc)."
+  mkdir -p /etc/network
+  cat > /etc/network/interfaces <<EOF
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+EOF
+}
+
+alpine_setup_services()
+{
+  echo_title "Enabling OpenRC services."
+  for s in devfs dmesg mdev hwdrivers; do rc-update add $s sysinit 2>/dev/null; done
+  for s in modules sysctl hostname bootmisc syslog networking; do rc-update add $s boot 2>/dev/null; done
+  for s in sshd chronyd local; do rc-update add $s default 2>/dev/null; done
+  for s in mount-ro killprocs savecache; do rc-update add $s shutdown 2>/dev/null; done
+  ## permit root ssh for headless server bring-up
+  sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config 2>/dev/null
+}
+
+alpine_set_timezone()
+{
+  echo_title "Setting timezone to \"${CHRX_TZ}\"."
+  if [ -f "/usr/share/zoneinfo/${CHRX_TZ}" ]; then
+    cp "/usr/share/zoneinfo/${CHRX_TZ}" /etc/localtime
+    echo "${CHRX_TZ}" > /etc/timezone
+  fi
+}
+
+alpine_set_root_password()
+{
+  ## headless bring-up credential — CHANGE AFTER FIRST BOOT
+  echo_title "Setting root password (root:root — change after first boot!)."
+  echo "root:root" | chpasswd
+}
+
+alpine_write_grub_default()
+{
+  echo_title "Writing /etc/default/grub (Alpine/pmOS)."
+  mkdir -p /etc/default
+  cat > /etc/default/grub <<EOF
+GRUB_TIMEOUT=5
+GRUB_TIMEOUT_STYLE=menu
+GRUB_DISTRIBUTOR="${CHRX_OS_DISTRO_DISPLAYNAME}"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet rootfstype=ext4"
+GRUB_CMDLINE_LINUX=""
+GRUB_DISABLE_RECOVERY=true
+GRUB_TERMINAL_OUTPUT=console
+EOF
+}
+
+alpine_build_initramfs()
+{
+  ## In a chroot the apk kernel trigger may not have run mkinitfs; do it.
+  local _kv
+  for _kv in $(ls /lib/modules 2>/dev/null); do
+    echo_title "Generating initramfs for kernel ${_kv} (mkinitfs)."
+    mkinitfs "${_kv}" || echo_title_yel "WARN: mkinitfs failed for ${_kv}"
+  done
 }
 
 ## begin
@@ -736,6 +1071,28 @@ case "${CHRX_OS_DISTRO}" in
       fedora_set_selinux_autolabel
     fi
     fedora_install_additional_packages
+    ;;
+  alpine|pmos|postmarketos)
+    alpine_setup_repos
+    alpine_install_base
+    pmos_install_overlay
+    alpine_setup_doas
+    alpine_setup_network
+    alpine_setup_services
+    alpine_set_timezone
+    alpine_set_root_password
+    write_default_fstab
+    alpine_write_grub_default
+    alpine_build_initramfs
+    ## reuse chrx's EFI grub-install + p12 chain-loader (Tianocore-aware).
+    ## CHRX_CONFIGURE_GRUB_ENABLED is empty for alpine, so install_grub
+    ## skips the Ubuntu-flavored configure_grub and keeps our grub default.
+    install_grub
+    ## additional pkgs (e.g. moosefs) via apk
+    for pkg in ${CHRX_ADD_PKGS}; do
+      echo_title "Installing additional package \"${pkg}\"."
+      apk --no-cache add ${pkg} || echo_title_yel "WARN: apk add ${pkg} failed."
+    done
     ;;
 esac
 
