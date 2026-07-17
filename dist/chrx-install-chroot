@@ -386,7 +386,7 @@ GRUB_TERMINAL_OUTPUT=gfxterm
 ##  noresume                  no resume partition (for hibernate)
 ##  noswap                    no swap partition
 ##
-GRUB_CMDLINE_LINUX_DEFAULT="quiet splash boot=local acpi_osi=Linux acpi_backlight=vendor add_efi_memmap intel_pstate=enable i915.modeset=1 tpm_tis.force=1 tpm_tis.interrupts=0 nmi_watchdog=panic,lapic elevator=noop ${CHRX_RESUME_PARTITION}"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash boot=local acpi_osi=Linux acpi_backlight=vendor add_efi_memmap intel_pstate=enable i915.modeset=1 tpm_tis.force=1 tpm_tis.interrupts=0 nmi_watchdog=panic,lapic panic=10 elevator=noop ${CHRX_RESUME_PARTITION}"
 
 EO_GRUB
 }

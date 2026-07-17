@@ -10,6 +10,205 @@
 
 eval_try umount -R ${CHRX_INSTALL_ROOT} 2>/dev/null ## be safe.
 
+## get_largest_cros_blockdev -- find the internal disk that carries a ChromeOS
+## GPT (STATE + KERN-A + ROOT-A), independent of what we booted from. Ported from
+## crap.sh. Lets chrx target the internal ChromeOS disk when run from a live USB
+## (where `rootdev` returns the USB stick, or isn't present at all), while still
+## resolving the same disk when run from within ChromeOS.
+get_largest_cros_blockdev() {
+  local largest size dev_name tmp_size remo
+  size=0
+  for blockdev in /sys/block/*; do
+    dev_name="${blockdev##*/}"
+    echo "$dev_name" | grep -q '^\(loop\|ram\)' && continue
+    tmp_size=$(cat "$blockdev"/size)
+    remo=$(cat "$blockdev"/removable)
+    if [ "$tmp_size" -gt "$size" ] && [ "${remo:-0}" -eq 0 ]; then
+      case "$(sfdisk -d "/dev/$dev_name" 2>/dev/null)" in
+        *'name="STATE"'*'name="KERN-A"'*'name="ROOT-A"'*)
+          largest="/dev/$dev_name"
+          size="$tmp_size"
+          ;;
+      esac
+    fi
+  done
+  echo "$largest"
+}
+
+## resize_stateful_clean -- shrink the STATE partition SAFELY, FILESYSTEM-FIRST,
+## so ChromeOS does NOT flag STATE "missing or damaged" and powerwash on the next
+## boot. Ported from CRaP's resize_stateful_menu (chrultrabook/crap). This is what
+## makes the no-flag dual-boot path single-pass and inherently safe: unlike the
+## legacy chrx path (which shrank the PARTITION without the FILESYSTEM and leaned
+## on a powerwash + reboot + second pass to rebuild STATE), we resize the ext4
+## filesystem to fit first, then shrink the partition to match, then partx -u
+## (no reboot). ChromeOS then mounts a valid, just-smaller STATE.
+##   $1 = new STATE size in SECTORS ; $2 = STATE partition device (e.g. .../p1)
+## Requires STATE unmounted -- true on a live USB (toram). In-ChromeOS callers
+## must chromeos_shutdown first; we refuse outright if it is still mounted.
+resize_stateful_clean() {
+  local new_sectors="$1" statepart="$2"
+  local cur_sectors sector_size block_size new_blocks
+
+  if [ -z "${new_sectors}" ] || [ "${new_sectors}" -le 0 ]; then
+    echo_fail "resize_stateful_clean: bad new size '${new_sectors}'."; return 1
+  fi
+  cur_sectors="`cgpt show -i 1 -n -s -q ${CHRX_TARGET_DISK}`"
+  if [ "${new_sectors}" -ge "${cur_sectors}" ]; then
+    echo_fail "resize_stateful_clean: new ${new_sectors} >= current ${cur_sectors} sectors; this path only shrinks."; return 1
+  fi
+
+  ## NEVER shrink a mounted stateful: ext4 cannot shrink online, and shrinking the
+  ## partition under a live filesystem IS the dirty-shrink powerwash trap.
+  if grep -q "^${statepart}[[:space:]]" /proc/mounts 2>/dev/null; then
+    echo_fail "STATE (${statepart}) is MOUNTED -- refusing to shrink."
+    echo_fail "Run from a live USB (STATE offline), or unmount/chromeos_shutdown first."
+    return 1
+  fi
+
+  block_size="`tune2fs -l ${statepart} 2>/dev/null | awk -F: '/Block size/ {gsub(/[^0-9]/,\"\",$2); print $2}'`"
+  if [ -z "${block_size}" ]; then
+    echo_fail "resize_stateful_clean: ${statepart} has no readable ext4 superblock (tune2fs failed)."; return 1
+  fi
+  sector_size=512
+  new_blocks=$(( (new_sectors * sector_size) / block_size ))
+
+  echo_info "Clean shrink of STATE (${statepart}): fs -> ${new_blocks} x ${block_size}B blocks, then partition -> ${new_sectors} sectors."
+  eval_try e2fsck -fy ${statepart}
+  if ! resize2fs ${statepart} ${new_blocks}; then
+    echo_fail "resize2fs failed -- STATE partition left UNCHANGED (safe). Aborting."
+    return 1
+  fi
+  if ! cgpt add -i 1 -s ${new_sectors} ${CHRX_TARGET_DISK}; then
+    echo_fail "cgpt shrink of STATE failed after fs resize -- do NOT boot ChromeOS; inspect with 'cgpt show ${CHRX_TARGET_DISK}'."
+    return 1
+  fi
+  eval_try partx -u -n 1 ${CHRX_TARGET_DISK}
+  echo_info "STATE shrunk cleanly -- no powerwash will be triggered."
+}
+
+## carve_kernc_rootc -- create KERN-C (i6) + ROOT-C (i7) in the free space AFTER
+## the (already-shrunk) STATE partition, then partx -u (no reboot). Shared by the
+## -S path (CRaP pre-shrank STATE) and the no-flag path (resize_stateful_clean
+## just shrank STATE). STATE (-i 1) is READ, never rewritten, here.
+carve_kernc_rootc() {
+  local kernc_size kernc_start rootc_start rootc_size
+  local stateful_start state_size disk_total_sectors
+  local min_rootc_size=2097152   # ~1 GiB floor for a usable Linux root
+
+  kernc_size=32768               # KERN-C is always 16 MiB
+  stateful_start="`cgpt show -i 1 -n -b -q ${CHRX_TARGET_DISK}`"
+  state_size="`cgpt show -i 1 -n -s -q ${CHRX_TARGET_DISK}`"
+
+  kernc_start=$(( stateful_start + state_size ))
+  rootc_start=$(( kernc_start + kernc_size ))
+
+  disk_total_sectors="`blockdev --getsz ${CHRX_TARGET_DISK} 2>/dev/null`"
+  if [ -z "${disk_total_sectors}" ]; then
+    disk_total_sectors=$(( `cgpt show ${CHRX_TARGET_DISK} | awk '/Sec GPT table/{print $1; exit}'` + 33 ))
+  fi
+  ## reserve 34 sectors at the end for the secondary GPT (header + 32 entries)
+  rootc_size=$(( disk_total_sectors - rootc_start - 34 ))
+
+  echo "  stateful_start ${stateful_start} (unchanged)"
+  echo "  state_size     ${state_size} (unchanged -- STATE NOT re-shrunk here)"
+  echo "  kernc_start    ${kernc_start}"
+  echo "  kernc_size     ${kernc_size}"
+  echo "  rootc_start    ${rootc_start}"
+  echo "  rootc_size     ${rootc_size}"
+
+  ## Sanity guard: if too little free space follows STATE, rootc_size comes out
+  ## tiny/negative -- cgpt would make a junk ROOT-C. Abort BEFORE touching the GPT.
+  if [ "${rootc_size}" -lt "${min_rootc_size}" ]; then
+    echo_fail "ROOT-C free space too small: ${rootc_size} sectors (need >= ${min_rootc_size})."
+    echo_fail "STATE was not shrunk enough -- free more space, then re-run."
+    exit 1
+  fi
+
+  cgpt add -i 6 -b ${kernc_start} -s ${kernc_size} -l KERN-C -t "kernel" ${CHRX_TARGET_DISK}
+  cgpt add -i 7 -b ${rootc_start} -s ${rootc_size} -l ROOT-C ${CHRX_TARGET_DISK}
+
+  echo_info "Updating kernel partition table (partx -u)..."
+  partx -u ${CHRX_TARGET_DISK}
+  echo_info "Partitions configured without reboot. Continuing to install..."
+}
+
+
+## --- removable / external target helpers (USB install path) ----------------
+## A USB stick or USB-SSD target lets a user install Linux WITHOUT touching the
+## internal ChromeOS disk -- the safest "try Linux" route, and the one most
+## non-technical users pick. These enumerate external drives and, crucially,
+## EXCLUDE the live medium we booted from so we never install over our own stick.
+is_removable_dev() {
+  local _d="${1##*/}"
+  [ "$(cat /sys/block/${_d}/removable 2>/dev/null)" = "1" ] && return 0
+  readlink -f "/sys/block/${_d}" 2>/dev/null | grep -q '/usb[0-9]' && return 0
+  return 1
+}
+
+boot_blockdev() {
+  ## whole-disk device the live medium booted from, so we can keep the boot stick
+  ## OUT of the target list. toram-aware: under `toram`, /run/live/medium is a
+  ## tmpfs (RAM copy) not the stick, so fall back to finding the stick by our ISO
+  ## volume label, then by any iso9660 signature. Best-effort -- empty if the
+  ## stick was physically removed after the toram copy (nothing to exclude then).
+  local _src _pk
+  _src="$(findmnt -n -o SOURCE /run/live/medium 2>/dev/null | head -1)"
+  case "${_src}" in /dev/*) ;; *) _src="" ;; esac   # ignore tmpfs (toram) / non-devices
+  [ -z "${_src}" ] && _src="$(findmnt -n -o SOURCE /lib/live/mount/medium 2>/dev/null | head -1)"
+  case "${_src}" in /dev/*) ;; *) _src="" ;; esac
+  [ -z "${_src}" ] && _src="$(blkid -L CPH-CHRX-LIVE 2>/dev/null | head -1)"
+  [ -z "${_src}" ] && _src="$(blkid -o device -t TYPE=iso9660 2>/dev/null | head -1)"
+  [ -z "${_src}" ] && return 0
+  _pk="$(lsblk -no PKNAME ${_src} 2>/dev/null | head -1)"
+  [ -n "${_pk}" ] && echo "/dev/${_pk}" || echo "${_src}"
+}
+
+list_removable_targets() {
+  ## emit "dev|size|model" per removable/external disk, minus the boot stick
+  local _boot _b _d _size _model
+  _boot="$(boot_blockdev)"
+  for _b in /sys/block/*; do
+    _d="${_b##*/}"
+    case "${_d}" in loop*|ram*|zram*|dm-*|md*) continue ;; esac
+    is_removable_dev "/dev/${_d}" || continue
+    [ "/dev/${_d}" = "${_boot}" ] && continue
+    _size="$(lsblk -dno SIZE /dev/${_d} 2>/dev/null | tr -d ' ')"
+    _model="$(lsblk -dno MODEL /dev/${_d} 2>/dev/null | sed 's/[[:space:]]*$//')"
+    echo "/dev/${_d}|${_size}|${_model}"
+  done
+}
+
+choose_usb_target() {
+  ## interactive picker: list external targets, set CHRX_TARGET_DISK to the choice.
+  ## returns 1 on none-available / cancel so the caller can fall back to internal.
+  local _list _i _dev _size _model _sel
+  _list="$(list_removable_targets)"
+  if [ -z "${_list}" ]; then
+    echo_warn "No removable/external drives found. Insert a USB drive (not the boot stick) and retry."
+    return 1
+  fi
+  echo_info "\nAvailable USB / external install targets:"
+  _i=0
+  while IFS='|' read -r _dev _size _model; do
+    [ -z "${_dev}" ] && continue
+    _i=$(( _i + 1 ))
+    echo_info "  ${_i}) ${_dev}  ${_size}  ${_model}"
+  done <<INNEREOF
+${_list}
+INNEREOF
+  echo_warn "Select a target number (or press [enter] to cancel): \c"
+  prompt_if_interactive
+  _sel="${PROMPT_RESPONSE}"
+  [ -z "${_sel}" ] && return 1
+  echo "${_sel}" | grep -q '^[0-9][0-9]*$' || { echo_fail "Not a number."; return 1; }
+  _dev="$(printf '%s\n' "${_list}" | sed -n "${_sel}p" | cut -d'|' -f1)"
+  [ -z "${_dev}" ] && { echo_fail "Selection out of range."; return 1; }
+  CHRX_TARGET_DISK="${_dev}"
+  echo_info "Selected USB target: ${ANSI_WHT}${CHRX_TARGET_DISK}${ANSI_RST}"
+  return 0
+}
+
 set_root_partition() {
   pnum=$1
 
@@ -120,36 +319,90 @@ setup_efi_partition() {
   fi
 }
 
-if [ "${CHRX_TARGET_DISK}" ]; then
-  echo_info "Installing to target disk ${ANSI_WHT}${CHRX_TARGET_DISK}${ANSI_RST}"
-  cat <<- EOF
-	${ANSI_YEL}
-	  WARNING: All data on ${CHRX_TARGET_DISK} will be erased!
-	           Continue at your own risk!
-	${ANSI_RST}
-	EOF
+## Guided target selection when no explicit -t target was given. Honors
+## CHRX_TARGET_MODE:  usb -> pick a removable/external drive (internal ChromeOS
+## untouched);  ask -> prompt internal-vs-USB;  internal (default) -> dual-boot on
+## the internal ChromeOS disk. The friendly front-end just sets CHRX_TARGET_MODE.
+if [ -z "${CHRX_TARGET_DISK}" ] && [ -z "${CHRX_SKIP_PARTITIONING}" ]; then
+  case "${CHRX_TARGET_MODE:-internal}" in
+    usb)
+      choose_usb_target || { echo_fail "No USB target selected -- aborting."; exit 1; }
+      ;;
+    ask)
+      echo_info "\nWhere should Linux be installed?"
+      echo_info "  1) A USB / external drive  (recommended -- your ChromeOS is NOT touched)"
+      echo_info "  2) Alongside ChromeOS on the internal disk  (dual-boot)"
+      echo_warn "Choose [1/2]: \c"
+      prompt_if_interactive
+      case "${PROMPT_RESPONSE}" in
+        1) choose_usb_target || { echo_fail "No USB target selected -- aborting."; exit 1; } ;;
+        *) : ;;
+      esac
+      ;;
+    *) : ;;
+  esac
+fi
 
+if [ "${CHRX_TARGET_DISK}" ]; then
+  ## Whole-disk install to ${CHRX_TARGET_DISK}. If it is a removable/external
+  ## device (USB stick or USB-SSD) the internal ChromeOS disk is NOT touched --
+  ## the safe "try Linux without risking my data" path most users will pick.
+  if is_removable_dev "${CHRX_TARGET_DISK}"; then
+    echo_info "Target ${ANSI_WHT}${CHRX_TARGET_DISK}${ANSI_RST} is removable/external -- your internal ChromeOS disk will NOT be modified."
+  else
+    echo_warn "Target ${ANSI_WHT}${CHRX_TARGET_DISK}${ANSI_RST} is an INTERNAL/fixed disk -- this ERASES the WHOLE disk (not a dual-boot)."
+  fi
+  echo_warn "${ANSI_YEL}WARNING: ALL data on ${CHRX_TARGET_DISK} will be erased!${ANSI_RST}"
   echo_warn "Press [enter] to continue or CTRL-C to quit: \c"
   prompt_if_interactive
 
-  echo_info "Setting up target disk ${CHRX_TARGET_DISK} formatting..."
+  echo_info "Setting up target disk ${CHRX_TARGET_DISK}..."
+  eval_try wipefs -a ${CHRX_TARGET_DISK} 2>/dev/null
 
-  #CHRX_ROOT_PARTITION="${CHRX_TARGET_DISK}1"
-  #if [[ "${CHRX_TARGET_DISK}" =~ "mmcblk" ]]; then
-  #  CHRX_ROOT_PARTITION="${CHRX_TARGET_DISK}p1"
-  #fi
-  set_root_partition 1
+  if is_efi_bootloader; then
+    ## Portable UEFI whole-disk layout: p1 = ESP (FAT32, 512 MiB, EFI-SYSTEM),
+    ## p2 = root. The chroot's grub-install --removable writes \EFI\BOOT\BOOTX64.EFI,
+    ## so the device boots on ANY UEFI machine (incl. any Chromebook's MrChromebox
+    ## edk2) with NO per-machine NVRAM boot entry.
+    ##
+    ## Use sgdisk, NOT cgpt, for this fresh whole-disk target. `cgpt create` writes
+    ## a protective MBR the Linux kernel rejects ("valid GPT with corrupt MBR"), so
+    ## partition nodes never appear -- verified on real USB hardware 2026-07-16
+    ## (is_removable_dev/detection worked, but /dev/sdX1..2 did not materialize).
+    ## A USB target needs no ChromeOS-GPT compatibility, so sgdisk -- which writes a
+    ## correct PMBR -- is the right tool. cgpt is retained ONLY for the internal
+    ## ChromeOS-disk paths (STATE shrink / KERN-C carve) that must stay compatible.
+    if ! command -v sgdisk >/dev/null 2>&1; then
+      echo_fail "sgdisk (gdisk) not found -- required for the whole-disk UEFI layout."; exit 1
+    fi
+    _dsz="$(blockdev --getsz ${CHRX_TARGET_DISK})"
+    if [ "${_dsz:-0}" -lt 3145728 ]; then   # ~1.5 GiB floor (512 MiB ESP + ~1 GiB root)
+      echo_fail "Target ${CHRX_TARGET_DISK} is too small for ESP + root (need >= ~1.5 GiB)."; exit 1
+    fi
+    echo_info "Creating GPT (ESP + root) for portable UEFI boot..."
+    eval_crit sgdisk --zap-all ${CHRX_TARGET_DISK}
+    eval_crit sgdisk -a 2048 -n 1:2048:+512M -t 1:ef00 -c 1:EFI-SYSTEM -n 2:0:0 -t 2:8300 -c 2:ROOT ${CHRX_TARGET_DISK}
+    eval_try partprobe ${CHRX_TARGET_DISK} 2>/dev/null
+    set_root_partition 2
+    ## CHRX_EFI_PARTITION is found + formatted + mounted by setup_efi_partition()
+    ## below, via blkid PARTLABEL=EFI-SYSTEM.
+  else
+    ## Legacy/BIOS whole-disk: single Linux partition (original behavior).
+    echo_info "Creating single-partition BIOS layout..."
+    set_root_partition 1
+    printf "g\nn\n\n\n\nw\n" | fdisk ${CHRX_TARGET_DISK} > /dev/null
+  fi
 
-  #dd if=/dev/zero of="${CHRX_ROOT_PARTITION}" bs=512 count=1
-  #printf ",,L,*\n" | sfdisk "${CHRX_TARGET_DISK}"
-  printf "g\nn\n\n\n\nw\n" | fdisk "${CHRX_TARGET_DISK}" > /dev/null
-  fdisk -l "${CHRX_TARGET_DISK}"
-  #echo debug ; read line
-  #blockdev --rereadpt "${CHRX_TARGET_DISK}"
-
+  eval_try partprobe ${CHRX_TARGET_DISK} 2>/dev/null
+  eval_try partx -u ${CHRX_TARGET_DISK} 2>/dev/null
+  sleep 1
+  fdisk -l ${CHRX_TARGET_DISK}
   echo_info "OK"
 else
-  CHRX_TARGET_DISK="`rootdev -d -s`"
+  ## Prefer the offline ChromeOS-GPT detector (works from a live USB); fall back
+  ## to rootdev when running from within ChromeOS or if detection comes up empty.
+  CHRX_TARGET_DISK="$(get_largest_cros_blockdev)"
+  [ -z "${CHRX_TARGET_DISK}" ] && CHRX_TARGET_DISK="`rootdev -d -s 2>/dev/null`"
   echo_info "Setting up target disk ${CHRX_TARGET_DISK} partitions..."
   # Do partitioning (if we haven't already)
   ckern_size="`cgpt show -i 6 -n -s -q ${CHRX_TARGET_DISK}`"
@@ -177,61 +430,7 @@ else
     ## ChromeOS "missing or damaged" recovery powerwash on the next ChromeOS boot.
     ## So here we ONLY carve KERN-C + ROOT-C out of the free space AFTER STATE.
 
-    kernc_size=32768 # kernc is always 16MB
-
-    ## existing STATE geometry (already-final from CRaP) -- read, never rewrite.
-    ## ${state_size} was read above via `cgpt show -i 1 -s`; leave STATE alone.
-    stateful_start="`cgpt show -i 1 -n -b -q ${CHRX_TARGET_DISK}`"
-
-    ## KERN-C / ROOT-C go immediately after the existing STATE partition
-    kernc_start=$((${stateful_start} + ${state_size}))
-    rootc_start=$((${kernc_start} + ${kernc_size}))
-
-    ## ROOT-C fills the remaining free space up to the last usable sector.
-    ## Reserve 34 sectors at the end for the secondary GPT (header + 32 entries).
-    disk_total_sectors="`blockdev --getsz ${CHRX_TARGET_DISK} 2>/dev/null`"
-    if [ -z "${disk_total_sectors}" ]; then
-      ## fallback: derive from cgpt's reported secondary GPT table location
-      disk_total_sectors=$(( `cgpt show ${CHRX_TARGET_DISK} | awk '/Sec GPT table/{print $1; exit}'` + 33 ))
-    fi
-    rootc_size=$((${disk_total_sectors} - ${rootc_start} - 34))
-
-    echo "  stateful_start ${stateful_start} (unchanged)"
-    echo "  state_size     ${state_size} (unchanged -- STATE NOT re-shrunk)"
-    echo "  kernc_start    ${kernc_start}"
-    echo "  kernc_size     ${kernc_size}"
-    echo "  rootc_start    ${rootc_start}"
-    echo "  rootc_size     ${rootc_size}"
-
-    ## Sanity guard (ewspikvm review): if CRaP didn't free enough space after STATE,
-    ## rootc_size can come out tiny/negative -- cgpt would then create a junk ROOT-C
-    ## or fail outright. Abort cleanly BEFORE touching the partition table.
-    min_rootc_size=2097152 # ~1 GiB floor for a usable Linux root
-    if [ "${rootc_size}" -lt "${min_rootc_size}" ]; then
-      echo_fail "ROOT-C free space too small: ${rootc_size} sectors (need >= ${min_rootc_size})."
-      echo_fail "CRaP left insufficient free space after STATE -- shrink STATE further, then re-run."
-      exit 1
-    fi
-
-    ## Carve KERN-C + ROOT-C into the free space ONLY. STATE (-i 1) is untouched.
-    ##
-    ## NOTE: we deliberately do NOT unmount /mnt/stateful_partition here. The
-    ## non-skip branch unmounts it because it rewrites STATE (-i 1) in place; this
-    ## branch only ADDS partitions in the free space after STATE, so STATE never
-    ## changes and can stay mounted. Keeping it mounted means a `chrx -S` run
-    ## driven over SSH does NOT lose its session (the SSH user's $HOME and shill's
-    ## state live on stateful) -- enabling a true single-pass, no-reboot resize.
-    ## `partx -u` below registers the new KERN-C/ROOT-C nodes while STATE stays up.
-    ## If a target's `partx -u` refuses to add partitions while the disk is busy,
-    ## fall back to: setsid/nohup the chrx run so it survives the dropped session,
-    ## umount -f stateful, partx -u, then restart shill to remount + restore net.
-    cgpt add -i 6 -b ${kernc_start} -s ${kernc_size} -l KERN-C -t "kernel" ${CHRX_TARGET_DISK}
-    cgpt add -i 7 -b ${rootc_start} -s ${rootc_size} -l ROOT-C ${CHRX_TARGET_DISK}
-
-    ## Instead of rebooting, tell the kernel to re-read the partition table.
-    ## This is the same approach CRaP uses after resizing partitions.
-    echo_info "Updating kernel partition table (partx -u)..."
-    partx -u ${CHRX_TARGET_DISK}
+    carve_kernc_rootc
 
     echo_info "Partitions configured without reboot. Continuing to install..."
 
@@ -287,57 +486,29 @@ else
     echo "  rootc_start    ${rootc_start}"
     echo "  rootc_size     ${rootc_size}"
 
-    ## WARNING: Confirm BEFORE modifying partition table
-    cat <<- EOF
-	${ANSI_RED}
-	  ╔══════════════════════════════════════════════════════════════════╗
-	  ║                         *** WARNING ***                          ║
-	  ╠══════════════════════════════════════════════════════════════════╣
-	  ║  This will modify the partition table on ${CHRX_TARGET_DISK}
-	  ║                                                                  ║
-	  ║  After this change:                                              ║
-	  ║    - ChromeOS will detect the modification on next boot          ║
-	  ║    - You will see "ChromeOS is missing or damaged" message       ║
-	  ║    - ChromeOS will perform a recovery/powerwash                  ║
-	  ║    - ALL USER DATA IN CHROMEOS WILL BE ERASED                    ║
-	  ║                                                                  ║
-	  ║  Make sure you have backed up any important data before          ║
-	  ║  proceeding!                                                     ║
-	  ╚══════════════════════════════════════════════════════════════════╝
-	${ANSI_RST}
-	EOF
+    ## SAFE single-pass: shrink STATE FILESYSTEM-FIRST (no ChromeOS powerwash),
+    ## then carve KERN-C/ROOT-C, then partx -u -- no reboot, no second pass.
+    ## Legacy chrx shrank the PARTITION without the FILESYSTEM here and relied on
+    ## ChromeOS flagging STATE "missing or damaged" -> powerwash + reboot + a
+    ## second chrx run to rebuild it. resize_stateful_clean resizes ext4 to fit
+    ## first, so ChromeOS mounts a valid, smaller STATE and never powerwashes.
+    case "$CHRX_TARGET_DISK" in
+      /dev/sd*) _statepart="${CHRX_TARGET_DISK}1" ;;
+      *)        _statepart="${CHRX_TARGET_DISK}p1" ;;
+    esac
 
-    echo_warn "Type 'yes' to confirm you have backed up your data and wish to proceed: \c"
+    echo_warn "STATE on ${CHRX_TARGET_DISK} -> ${stateful_size} sectors (filesystem-first, no powerwash);"
+    echo_warn "then carve KERN-C/ROOT-C into the freed space. Single pass, no reboot."
+    echo_warn "Press [enter] to proceed or CTRL-C to quit: \c"
     prompt_if_interactive
-    if [ "${PROMPT_RESPONSE}" != "yes" ]; then
-      echo_fail "\nPartition modification cancelled. No changes have been made."
+
+    echo_info "\nShrinking STATE cleanly to make room for Linux."
+    resize_stateful_clean "${stateful_size}" "${_statepart}" || {
+      echo_fail "Clean STATE shrink failed -- aborting before any KERN-C/ROOT-C carve."
       exit 1
-    fi
+    }
 
-    ## Do the real work
-    echo_info "\n\nModifying partition table to make room for Linux."
-
-    umount -f /mnt/stateful_partition > /dev/null 2>&1
-    cgpt add -i 1 -b ${stateful_start} -s ${stateful_size} -l STATE ${CHRX_TARGET_DISK}
-    cgpt add -i 6 -b ${kernc_start} -s ${kernc_size} -l KERN-C -t "kernel" ${CHRX_TARGET_DISK}
-    cgpt add -i 7 -b ${rootc_start} -s ${rootc_size} -l ROOT-C ${CHRX_TARGET_DISK}
-
-    cat <<- EOF
-		${ANSI_GRN}
-		Partition table has been modified successfully.
-
-		Your Chromebook will now reboot and ChromeOS will clear your data.
-
-		Run chrx again after reboot to install Linux.
-		${ANSI_RST}
-		EOF
-    echo_warn "Press [enter] to reboot: \c"
-    prompt_if_interactive
-
-    ## reboot without dropping user to shell
-    reboot
-    sleep 10
-    exit
+    carve_kernc_rootc
   fi
 fi
 
