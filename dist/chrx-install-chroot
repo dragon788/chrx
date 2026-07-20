@@ -388,6 +388,14 @@ GRUB_TERMINAL_OUTPUT=gfxterm
 ##
 GRUB_CMDLINE_LINUX_DEFAULT="quiet splash boot=local acpi_osi=Linux acpi_backlight=vendor add_efi_memmap intel_pstate=enable i915.modeset=1 tpm_tis.force=1 tpm_tis.interrupts=0 nmi_watchdog=panic,lapic panic=10 elevator=noop ${CHRX_RESUME_PARTITION}"
 
+## D6 (ADR-0008): never let os-prober generate menu entries for the ChromeOS
+## partitions. The stock ChromeOS ESP grub.cfg boots KERN-A/ROOT-A via
+## cros_efi/gptpriority + dm-verity -- kernels a generic GRUB cannot chain-load,
+## so os-prober picking them up yields boot-menu items that hang/fail. ChromeOS
+## boots via its OWN firmware path (depthcharge / its own ESP grub), never ours.
+## Explicit =true is also version-robust: pre-2.06 GRUB ran os-prober by default.
+GRUB_DISABLE_OS_PROBER=true
+
 EO_GRUB
 }
 
